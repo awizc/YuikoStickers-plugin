@@ -1,0 +1,1 @@
+# YuikoStickers-plugin
