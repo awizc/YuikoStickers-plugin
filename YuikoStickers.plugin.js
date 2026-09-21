@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.0
+ * @version 2.17.1
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -28,6 +28,8 @@ module.exports = class YuikoStickers {
         this.updateURL = "https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js";
         // 실행 중에는 매 정시(00분)마다 GitHub 버전을 다시 확인
         this.updateTimer = null;
+        this.updateInFlight = false;
+        this.lastPluginUpdateCheck = 0;
         this.updated = false;
         this.running = false;
 
@@ -78,7 +80,8 @@ module.exports = class YuikoStickers {
 
     start() {
         this.running = true;
-        this.checkPluginUpdate();
+        this.updated = false;
+        this.checkPluginUpdate(true);
         this.scheduleHourlyUpdateCheck();
         this.addStyles();
         this.loadFavorites();
@@ -315,9 +318,12 @@ module.exports = class YuikoStickers {
     async fetchPluginSource() {
         if (this.updateAPIURL) {
             try {
-                const response = await BdApi.Net.fetch(this.updateAPIURL, {cache:'no-store', headers:{Accept:'application/vnd.github.raw+json'}});
-                if (response.ok) return await response.text();
-                console.warn('[YuikoStickers] GitHub API 응답 오류, raw 주소로 재시도:', response.status);
+                const url = new URL(this.updateAPIURL); url.searchParams.set('t', Date.now());
+                const response = await BdApi.Net.fetch(url.href, {cache:'no-store', headers:{Accept:'application/vnd.github.raw+json'}});
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const source = await response.text();
+                if (!source.match(/^\s*\*\s*@version\s+(\S+)/m) || !source.includes('module.exports')) throw new Error('GitHub API가 플러그인 소스를 반환하지 않음');
+                return source;
             } catch (error) { console.warn('[YuikoStickers] GitHub API 요청 실패, raw 주소로 재시도:', error.message); }
         }
         const url = this.updateURL + (this.updateURL.includes('?') ? '&' : '?') + 't=' + Date.now();
@@ -326,26 +332,35 @@ module.exports = class YuikoStickers {
         return await response.text();
     }
 
-    async checkPluginUpdate() {
-        if (!this.updateURL && !this.updateAPIURL) return;
+    async checkPluginUpdate(notifyResult = false) {
+        if ((!this.updateURL && !this.updateAPIURL) || this.updateInFlight || !this.running || this.updated) return;
+        this.updateInFlight = true;
+        this.lastPluginUpdateCheck = Date.now();
         try {
             const source = await this.fetchPluginSource();
             const remoteVersion = source.match(/^\s*\*\s*@version\s+(\S+)/m)?.[1];
             if (!remoteVersion || !source.includes('module.exports')) throw new Error('플러그인 파일 형식이 아님');
             const fs = require('fs'), path = require('path');
             const file = path.join(BdApi.Plugins.folder, `${this.pluginName}.plugin.js`);
-            // BdApi에서 버전을 못 읽었으면 파일 헤더에서 직접 읽음. 그래도 모르면 무한 덮어쓰기를 피하기 위해 중단
-            let localVersion = this.version;
-            if (localVersion === 'unknown') localVersion = fs.readFileSync(file, 'utf8').match(/^\s*\*\s*@version\s+(\S+)/m)?.[1] || 'unknown';
+            // 로드 시점의 메타데이터 대신 실제 설치 파일 버전과 비교한다.
+            const localSource = fs.readFileSync(file, 'utf8');
+            const localVersion = localSource.match(/^\s*\*\s*@version\s+(\S+)/m)?.[1] || 'unknown';
             if (localVersion === 'unknown') throw new Error('현재 버전을 알 수 없어 업데이트를 건너뜀');
-            if (!this.isNewerVersion(remoteVersion, localVersion)) return;
+            if (!this.isNewerVersion(remoteVersion, localVersion)) {
+                console.info(`[YuikoStickers] 업데이트 확인: 설치 ${localVersion}, GitHub ${remoteVersion} (업데이트 없음)`);
+                if (notifyResult && this.running) BdApi.UI.showToast(`YuikoStickers ${localVersion}: 새로운 업데이트가 없습니다.`, {type:'info'});
+                return;
+            }
             if (!this.running) return;
-            if (fs.readFileSync(file, 'utf8') === source) return;
+            if (localSource === source) return;
             fs.writeFileSync(file, source, 'utf8');
             BdApi.UI.showToast(`YuikoStickers ${localVersion} → ${remoteVersion} 업데이트됨`, {type:'success'});
             this.updated = true;
             if (this.updateTimer) { clearTimeout(this.updateTimer); this.updateTimer = null; }
-        } catch (error) { console.warn('[YuikoStickers] 업데이트 확인 실패:', error.message); }
+        } catch (error) {
+            console.warn('[YuikoStickers] 업데이트 확인 실패:', error.message);
+            if (this.running) BdApi.UI.showToast(`YuikoStickers 업데이트 확인 실패: ${error.message}`, {type:'error'});
+        } finally { this.updateInFlight = false; }
     }
 
     fetchWithVersion(url) {
@@ -668,6 +683,8 @@ module.exports = class YuikoStickers {
         if (this.panel.style.display === 'flex') return this.closePanel();
         if (!this.composer?.isConnected) return BdApi.UI.showToast('Discord 메시지 입력창을 찾을 수 없습니다.', {type:'error'});
         this.saveComposerSelection(); this.panel.style.display = 'flex';
+        // 정시를 기다리지 않고 패널을 열 때도 확인하되 GitHub 요청은 5분 간격으로 제한한다.
+        if (Date.now() - this.lastPluginUpdateCheck >= 5 * 60 * 1000) this.checkPluginUpdate();
         const rect = button.getBoundingClientRect(), panelRect = this.panel.getBoundingClientRect(), margin = 10;
         let left = Math.min(rect.left, innerWidth-panelRect.width-margin), top = rect.top-panelRect.height-8;
         if (top < margin) top = Math.min(rect.bottom+8, innerHeight-panelRect.height-margin);
