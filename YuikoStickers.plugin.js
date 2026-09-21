@@ -740,7 +740,7 @@ module.exports = class YuikoStickers {
         const composer = this.composer;
         if (!composer?.isConnected) return BdApi.UI.showToast('Discord 메시지 입력창을 찾을 수 없습니다.', {type:'error'});
         const selectedItems = [...this.queuedItems, item];
-        const command = selectedItems.map(selected => `${this.commandPrefix}{${selected.name.split(',')[0].trim()}}`).join('');
+        const command = selectedItems.map(selected => `${this.commandPrefix}${selected.name.split(',')[0].trim()}`).join('');
         this.closePanel(); composer.focus(); const selection = window.getSelection();
         if (this.savedSelection && composer.contains(this.savedSelection.commonAncestorContainer)) { selection.removeAllRanges(); selection.addRange(this.savedSelection.cloneRange()); } else { const range = document.createRange(); range.selectNodeContents(composer); range.collapse(false); selection.removeAllRanges(); selection.addRange(range); }
         const allowed = composer.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, cancelable:true, inputType:'insertText', data:command}));
