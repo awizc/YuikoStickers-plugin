@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.16.0
+ * @version 2.17.0
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -15,6 +15,12 @@ module.exports = class YuikoStickers {
         this.apiBase = "https://snow.modaweb.kr/api/yuiko/";
         this.commandPrefix = ".";
         this.autoSend = true;
+        this.favoriteGesture = 'longPress';
+        this.queuedItems = [];
+        this.queueStatus = null;
+        this.longPressTimer = null;
+        this.suppressEmojiClick = false;
+        this.unbindGridPress = null;
         this.version = this.getVersion();
 
         // 업데이트 확인 주소. GitHub API가 우선(캐시 1분, IP당 시간당 60회 제한), 실패하면 raw 주소로 대체(CDN 캐시 최대 5분 — 쿼리스트링으로도 안 뚫림)
@@ -78,6 +84,7 @@ module.exports = class YuikoStickers {
         this.loadFavorites();
         this.loadRecent();
         this.loadSortSetting();
+        this.loadFavoriteGesture();
         this.loadGroupSettings();
         this.loadGroupThumbs();
         this.loadCache();
@@ -86,6 +93,9 @@ module.exports = class YuikoStickers {
     }
 
     stop() {
+        this.cancelLongPress();
+        this.unbindGridPress?.(); this.unbindGridPress = null;
+        this.queuedItems = []; this.queueStatus = null;
         this.running = false;
         this.observer?.disconnect();
         this.observer = null;
@@ -169,9 +179,12 @@ module.exports = class YuikoStickers {
             .yuiko-item { position:relative; width:64px; height:64px; min-width:64px; user-select:none; outline:none; display:flex; align-items:center; justify-content:center; box-sizing:border-box; padding:5px; border:1px solid var(--yk-border); border-radius:8px; background:var(--yk-bg2); cursor:pointer; overflow:visible; transition:background .12s,border-color .12s,transform .12s; }
             .yuiko-item:hover { background:var(--yk-bg4); border-color:var(--yk-muted); transform:scale(1.06); z-index:1; }
             .yuiko-item img { display:block; width:54px; height:54px; object-fit:contain; pointer-events:none; }
-            .yuiko-section { grid-column:1/-1; display:flex; align-items:center; gap:8px; min-height:20px; color:var(--yk-muted); font-size:12px; font-weight:600; line-height:1.6; }
+            .yuiko-section { grid-column:1/-1; display:flex; align-items:center; gap:8px; min-height:20px; margin-bottom:8px; color:var(--yk-muted); font-size:12px; font-weight:600; line-height:1.6; }
             .yuiko-section::after { content:""; flex:1; height:1px; background:var(--yk-border); order:1; }
-            .yuiko-sort { order:2; font-size:11px; flex-shrink:0; }
+            .yuiko-sort, .yuiko-favorite-gesture { display:inline-flex; align-items:center; justify-content:center; box-sizing:border-box; height:28px; margin:0; padding:5px 8px; border:1px solid var(--yk-border); border-radius:5px; background:transparent; color:var(--yk-muted); cursor:pointer; font-family:inherit; font-size:11px; font-weight:500; line-height:16px; white-space:nowrap; flex-shrink:0; }
+            .yuiko-sort { order:3; }
+            .yuiko-favorite-gesture { order:2; }
+            .yuiko-sort:hover, .yuiko-favorite-gesture:hover { background:var(--yk-hover); color:var(--yk-text); }
             .yuiko-preview { position:fixed; z-index:1000000; display:none; padding:10px; border:1px solid var(--yk-border); border-radius:8px; background:var(--yk-bg); box-shadow:var(--yk-shadow); pointer-events:none; }
             .yuiko-preview.is-visible { display:flex; }
             .yuiko-preview img { display:block; width:${this.previewSize}px; height:${this.previewSize}px; object-fit:contain; }
@@ -190,8 +203,19 @@ module.exports = class YuikoStickers {
             .yuiko-group-preview-grid img { width:38px; height:38px; object-fit:contain; box-sizing:border-box; padding:3px; border-radius:6px; background:var(--yk-bg2); }
             .yuiko-group-preview-empty { color:var(--yk-muted); font-size:12px; line-height:1.6; }
             .yuiko-status { padding:7px 10px; border-top:1px solid var(--yk-border); color:var(--yk-muted); font-size:12px; flex-shrink:0; line-height:1.5; }
+            .yuiko-status:empty { display:none; }
             .yuiko-status.is-error { color:#f23f43; cursor:pointer; }
             .yuiko-status.is-error:hover { text-decoration:underline; }
+            .yuiko-queue-status { display:none; padding:7px 10px; color:var(--yk-muted); font-size:12px; flex-shrink:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+            .yuiko-queue-status.has-items { display:block; border-top:1px solid var(--yk-border); padding:8px 10px; }
+            .yuiko-queue-header { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
+            .yuiko-queue-clear { padding:2px 6px; border:1px solid var(--yk-border); border-radius:4px; background:transparent; color:var(--yk-muted); font:inherit; cursor:pointer; }
+            .yuiko-queue-list { display:flex; gap:8px; overflow-x:auto; padding:4px 0 6px; scrollbar-width:thin; scrollbar-color:var(--yk-scroll) transparent; }
+            .yuiko-queue-item { position:relative; width:56px; height:56px; flex:0 0 56px; box-sizing:border-box; border:1px solid var(--yk-border); border-radius:6px; background:var(--yk-bg2); }
+            .yuiko-queue-item img { display:block; width:44px; height:44px; margin:5px; object-fit:contain; }
+            .yuiko-queue-number { position:absolute; left:2px; bottom:2px; min-width:14px; padding:0 2px; border-radius:3px; background:var(--yk-bg); color:var(--yk-text); font-size:10px; line-height:16px; text-align:center; }
+            .yuiko-queue-remove { position:absolute; top:1px; right:1px; display:flex; align-items:center; justify-content:center; width:18px; height:18px; padding:0; border:1px solid var(--yk-border); border-radius:4px; background:var(--yk-bg); color:var(--yk-text); font-size:14px; line-height:1; cursor:pointer; }
+            .yuiko-queue-remove:hover, .yuiko-queue-clear:hover { background:var(--yk-bg4); color:var(--yk-heading); }
         `);
     }
 
@@ -466,7 +490,9 @@ module.exports = class YuikoStickers {
         const body = document.createElement('div'); body.className = 'yuiko-body';
         const main = document.createElement('div'); main.className = 'yuiko-main';
         main.append(managePanel, grid); body.append(groupbar, main);
-        panel.append(header, body, status); document.body.appendChild(panel);
+        const queueStatus = document.createElement('div'); queueStatus.className = 'yuiko-queue-status';
+        this.queueStatus = queueStatus;
+        panel.append(header, body, status, queueStatus); document.body.appendChild(panel);
         this.panel = panel; this.grid = grid; this.status = status; this.searchInput = search;
         this.renderGroupControls(); this.createPreview(); this.createGroupPreview(); this.bindGroupPreview(managePanel);
         manage.addEventListener('click', event => { event.stopPropagation(); managePanel.classList.toggle('is-open'); this.hideGroupPreview(); this.renderGroupControls(); });
@@ -553,11 +579,85 @@ module.exports = class YuikoStickers {
     }
 
     bindGridEvents(grid) {
-        const findItem = target => { const url = target.closest('.yuiko-item')?.dataset.url; return this.itemByUrl.get(url) || this.knownItems.get(url) || null; };
-        grid.addEventListener('click', event => { if (this.suppressNextClick) return; if (event.target.closest('.yuiko-sort')) return this.toggleSort(); const item = findItem(event.target); if (!item) return; this.useEmoji(item); });
-        grid.addEventListener('contextmenu', event => { const item = findItem(event.target); if (!item) return; event.preventDefault(); this.toggleFavorite(item); });
+        const findItem = target => { const url = target?.closest?.('.yuiko-item')?.dataset.url; return this.itemByUrl.get(url) || this.knownItems.get(url) || null; };
+        grid.addEventListener('pointerdown', event => {
+            this.cancelLongPress(); this.suppressEmojiClick = false;
+            if (event.button !== 0 || this.favoriteGesture !== 'longPress') return;
+            const item = findItem(event.target); if (!item) return;
+            this.longPressTimer = setTimeout(() => {
+                this.longPressTimer = null;
+                if (this.dragActive) return;
+                this.suppressEmojiClick = true;
+                this.toggleFavorite(item);
+            }, 1000);
+        });
+        const cancelPress = () => this.cancelLongPress();
+        document.addEventListener('pointerup', cancelPress, true);
+        document.addEventListener('pointercancel', cancelPress, true);
+        window.addEventListener('blur', cancelPress);
+        grid.addEventListener('pointerleave', cancelPress);
+        grid.addEventListener('pointerout', event => { if (findItem(event.target) !== findItem(event.relatedTarget)) cancelPress(); });
+        grid.addEventListener('scroll', () => { cancelPress(); this.hidePreview(); }, {passive:true});
+        grid.addEventListener('dragstart', event => event.preventDefault());
+        this.unbindGridPress = () => {
+            document.removeEventListener('pointerup', cancelPress, true);
+            document.removeEventListener('pointercancel', cancelPress, true);
+            window.removeEventListener('blur', cancelPress);
+        };
+        grid.addEventListener('click', event => {
+            if (this.suppressEmojiClick) { event.preventDefault(); event.stopPropagation(); this.suppressEmojiClick = false; return; }
+            if (this.suppressNextClick) return;
+            if (event.target.closest('.yuiko-favorite-gesture')) {
+                event.preventDefault(); event.stopPropagation();
+                return this.setFavoriteGesture(this.favoriteGesture === 'longPress' ? 'shiftRightClick' : 'longPress');
+            }
+            if (event.target.closest('.yuiko-sort')) return this.toggleSort();
+            const item = findItem(event.target); if (item) this.useEmoji(item);
+        });
+        grid.addEventListener('contextmenu', event => {
+            const item = findItem(event.target); if (!item) return;
+            event.preventDefault(); event.stopPropagation(); this.cancelLongPress();
+            if (this.favoriteGesture === 'shiftRightClick' && event.shiftKey) return this.toggleFavorite(item);
+            this.queuedItems.push(item); this.updateQueueStatus(true);
+        });
         grid.addEventListener('mousemove', event => { if (this.dragActive) return; const item = findItem(event.target); if (item) this.showPreview(item, event); else this.hidePreview(); });
         grid.addEventListener('mouseleave', () => this.hidePreview());
+    }
+
+    cancelLongPress() { clearTimeout(this.longPressTimer); this.longPressTimer = null; }
+    favoriteGestureLabel() { return this.favoriteGesture === 'shiftRightClick' ? 'Shift+우클릭' : '1초 이상 길게 누르기'; }
+    loadFavoriteGesture() { this.favoriteGesture = BdApi.Data.load(this.pluginName, 'favoriteGesture') === 'shiftRightClick' ? 'shiftRightClick' : 'longPress'; }
+    setFavoriteGesture(value) {
+        this.cancelLongPress();
+        this.favoriteGesture = value === 'shiftRightClick' ? value : 'longPress';
+        BdApi.Data.save(this.pluginName, 'favoriteGesture', this.favoriteGesture);
+        this.rerender();
+    }
+    updateQueueStatus(scrollToEnd = false) {
+        if (!this.queueStatus) return;
+        const previousScroll = this.queueStatus.querySelector('.yuiko-queue-list')?.scrollLeft || 0;
+        this.queueStatus.replaceChildren();
+        this.queueStatus.classList.toggle('has-items', this.queuedItems.length > 0);
+        this.queueStatus.removeAttribute('title');
+        if (!this.queuedItems.length) return;
+        const header = document.createElement('div'); header.className = 'yuiko-queue-header';
+        const label = document.createElement('span'); label.textContent = `전송 대기 ${this.queuedItems.length}개 · 이모지 좌클릭으로 함께 전송`;
+        const clear = document.createElement('button'); clear.className = 'yuiko-queue-clear'; clear.type = 'button'; clear.textContent = '전체 비우기';
+        clear.addEventListener('click', () => { this.queuedItems = []; this.updateQueueStatus(); });
+        header.append(label, clear);
+        const list = document.createElement('div'); list.className = 'yuiko-queue-list'; list.setAttribute('role', 'list'); list.setAttribute('aria-label', '전송 대기 이모지');
+        this.queuedItems.forEach((item, index) => {
+            const name = item.name.split(',')[0].trim();
+            const card = document.createElement('div'); card.className = 'yuiko-queue-item'; card.setAttribute('role', 'listitem'); card.title = `${index + 1}. ${name}`;
+            const image = document.createElement('img'); image.src = item.url; image.alt = name; image.draggable = false;
+            const number = document.createElement('span'); number.className = 'yuiko-queue-number'; number.textContent = String(index + 1);
+            const remove = document.createElement('button'); remove.className = 'yuiko-queue-remove'; remove.type = 'button'; remove.textContent = '×';
+            remove.title = `${index + 1}번 ${name} 선택 취소`; remove.setAttribute('aria-label', remove.title);
+            remove.addEventListener('click', () => { this.queuedItems.splice(index, 1); this.updateQueueStatus(); });
+            card.append(image, number, remove); list.appendChild(card);
+        });
+        this.queueStatus.append(header, list);
+        list.scrollLeft = scrollToEnd ? list.scrollWidth : previousScroll;
     }
 
     showPreview(item, event) { this.previewImage.src = item.url; this.preview.classList.add('is-visible'); let left = event.clientX + 18, top = event.clientY + 18; const width = this.preview.offsetWidth || 200, height = this.preview.offsetHeight || 220; if (left + width > innerWidth - 10) left = event.clientX - width - 18; if (top + height > innerHeight - 10) top = event.clientY - height - 18; this.preview.style.left = `${Math.max(10,left)}px`; this.preview.style.top = `${Math.max(10,top)}px`; }
@@ -574,6 +674,7 @@ module.exports = class YuikoStickers {
         this.panel.style.left = `${Math.max(margin,left)}px`; this.panel.style.top = `${Math.max(margin,top)}px`; this.bindOutsideClick(); this.checkForUpdates();
     }
     closePanel() {
+        this.cancelLongPress(); this.queuedItems = []; this.updateQueueStatus();
         if (this.panel) {
             this.panel.style.display = 'none';
             this.panel.querySelector('.yuiko-manage')?.classList.remove('is-open');
@@ -586,6 +687,7 @@ module.exports = class YuikoStickers {
 
     render(filter = '') {
         if (!this.grid) return;
+        this.cancelLongPress();
         this.hidePreview(); this.grid.replaceChildren();
         const query = filter.trim().toLowerCase();
         const items = this.items.filter(item => !query || item.name.toLowerCase().includes(query));
@@ -595,9 +697,23 @@ module.exports = class YuikoStickers {
         this.grid.appendChild(this.createSection(`${this.selectedGroupId === null ? '선택 그룹' : this.groups.find(group => group.id === this.selectedGroupId)?.name || '그룹'} · 전체 ${items.length}`, true));
         this.sortItems(items).forEach(item => this.grid.appendChild(this.createItem(item)));
         this.clearStatusError();
-        this.status.textContent = this.selectedGroupId === null && !this.enabledGroupIds?.length ? '표시할 그룹이 없습니다. ⚙에서 그룹을 선택하세요.' : `${items.length}개 표시 · 우클릭으로 즐겨찾기 추가/해제`;
+        this.status.textContent = this.selectedGroupId === null && !this.enabledGroupIds?.length ? '표시할 그룹이 없습니다. ⚙에서 그룹을 선택하세요.' : '';
+        this.updateQueueStatus();
     }
-    createSection(label, withSort = false) { const section = document.createElement('div'); section.className = 'yuiko-section'; const text = document.createElement('span'); text.textContent = label; section.appendChild(text); if (withSort) { const sort = document.createElement('button'); sort.className = 'yuiko-sort'; sort.type = 'button'; sort.textContent = this.sortByRecent ? '🕒 최근순' : '기본순'; section.appendChild(sort); } return section; }
+    createSection(label, withSort = false) {
+        const section = document.createElement('div'); section.className = 'yuiko-section';
+        const text = document.createElement('span'); text.textContent = label; section.appendChild(text);
+        if (withSort) {
+            const gesture = document.createElement('button'); gesture.className = 'yuiko-favorite-gesture'; gesture.type = 'button';
+            gesture.textContent = this.favoriteGesture === 'shiftRightClick' ? '☆ Shift+우클릭' : '☆ 1초 누르기';
+            gesture.title = `즐겨찾기: ${this.favoriteGestureLabel()} · 클릭하면 방식 변경`;
+            gesture.setAttribute('aria-label', gesture.title);
+            const sort = document.createElement('button'); sort.className = 'yuiko-sort'; sort.type = 'button';
+            sort.textContent = this.sortByRecent ? '🕒 최근순' : '기본순';
+            section.append(gesture, sort);
+        }
+        return section;
+    }
     /**
      * 이모지 칸 (포인터 드래그 정렬을 위해 <button> 대신 <div>)
      */
@@ -606,13 +722,14 @@ module.exports = class YuikoStickers {
     useEmoji(item) {
         const composer = this.composer;
         if (!composer?.isConnected) return BdApi.UI.showToast('Discord 메시지 입력창을 찾을 수 없습니다.', {type:'error'});
-        const commandName = item.name.split(',')[0].trim();
-        const command = `${this.commandPrefix}${commandName}`;
+        const selectedItems = [...this.queuedItems, item];
+        const command = selectedItems.map(selected => `${this.commandPrefix}{${selected.name.split(',')[0].trim()}}`).join('');
         this.closePanel(); composer.focus(); const selection = window.getSelection();
         if (this.savedSelection && composer.contains(this.savedSelection.commonAncestorContainer)) { selection.removeAllRanges(); selection.addRange(this.savedSelection.cloneRange()); } else { const range = document.createRange(); range.selectNodeContents(composer); range.collapse(false); selection.removeAllRanges(); selection.addRange(range); }
         const allowed = composer.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, cancelable:true, inputType:'insertText', data:command}));
-        if (allowed) document.execCommand('insertText', false, command);
-        this.addRecent(item); if (!allowed || this.autoSend) this.sendMessage(composer);
+        if (allowed && !document.execCommand('insertText', false, command)) return BdApi.UI.showToast('Discord가 입력을 처리하지 못했습니다.', {type:'error'});
+        selectedItems.forEach(selected => this.addRecent(selected));
+        if (!allowed || this.autoSend) this.sendMessage(composer);
     }
     sendMessage(composer) { if (!this.autoSend) return; setTimeout(() => { if (!composer?.isConnected) return; composer.focus(); composer.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true})); composer.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true})); this.savedSelection = null; }, 0); }
 
@@ -665,9 +782,11 @@ module.exports = class YuikoStickers {
         });
         container.addEventListener('pointermove', event => {
             if (!state) return;
+            if (this.suppressEmojiClick || !state.element.isConnected) { state = null; return; }
             if (!state.active) {
                 if (Math.hypot(event.clientX-state.startX, event.clientY-state.startY) < threshold) return;
                 state.active = true; this.dragActive = true;
+                this.cancelLongPress();
                 state.element.classList.add('is-dragging'); this.hidePreview(); this.hideGroupPreview();
                 try { container.setPointerCapture(event.pointerId); } catch {}
             }
