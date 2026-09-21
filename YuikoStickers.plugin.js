@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.2
+ * @version 2.17.3
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -116,6 +116,12 @@ module.exports = class YuikoStickers {
 
     addStyles() {
         BdApi.DOM.addStyle(this.pluginName, `
+            /* 채팅 이미지 위의 Discord GIF 배지만 숨김 (움직이는 이미지는 유지) */
+            [id^="chat-messages-"] [class^="gifTag_"],
+            [id^="chat-messages-"] [class*=" gifTag_"],
+            [id^="chat-messages-"] [class^="embedGIFTag_"],
+            [id^="chat-messages-"] [class*=" embedGIFTag_"] { display:none !important; }
+
             /* 테마 색상 토큰. 기본은 다크(디스코드 어두운 테마 3종 공통), html.theme-light면 라이트 토큰으로 교체 */
             .yuiko-panel, .yuiko-preview, .yuiko-group-preview {
                 --yk-bg:#1e1f22; --yk-bg2:#2b2d31; --yk-bg3:#313338; --yk-bg4:#383a40;
