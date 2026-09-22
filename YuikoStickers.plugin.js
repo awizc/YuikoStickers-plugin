@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.7
+ * @version 2.17.8
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -15,7 +15,6 @@ module.exports = class YuikoStickers {
         this.apiBase = "https://snow.modaweb.kr/api/yuiko/";
         this.commandPrefix = ".";
         this.autoSend = true;
-        this.favoriteGesture = 'longPress';
         this.queuedItems = [];
         this.queueStatus = null;
         this.longPressTimer = null;
@@ -96,7 +95,6 @@ module.exports = class YuikoStickers {
         this.loadFavorites();
         this.loadRecent();
         this.loadSortSetting();
-        this.loadFavoriteGesture();
         this.loadGroupSettings();
         this.loadGroupThumbs();
         this.loadCache();
@@ -216,10 +214,9 @@ module.exports = class YuikoStickers {
             .yuiko-item img { display:block; width:54px; height:54px; object-fit:contain; pointer-events:none; }
             .yuiko-section { grid-column:1/-1; display:flex; align-items:center; gap:8px; min-height:20px; margin-bottom:8px; color:var(--yk-muted); font-size:12px; font-weight:600; line-height:1.6; }
             .yuiko-section::after { content:""; flex:1; height:1px; background:var(--yk-border); order:1; }
-            .yuiko-sort, .yuiko-favorite-gesture { display:inline-flex; align-items:center; justify-content:center; box-sizing:border-box; height:28px; margin:0; padding:5px 8px; border:1px solid var(--yk-border); border-radius:5px; background:transparent; color:var(--yk-muted); cursor:pointer; font-family:inherit; font-size:11px; font-weight:500; line-height:16px; white-space:nowrap; flex-shrink:0; }
+            .yuiko-sort { display:inline-flex; align-items:center; justify-content:center; box-sizing:border-box; height:28px; margin:0; padding:5px 8px; border:1px solid var(--yk-border); border-radius:5px; background:transparent; color:var(--yk-muted); cursor:pointer; font-family:inherit; font-size:11px; font-weight:500; line-height:16px; white-space:nowrap; flex-shrink:0; }
             .yuiko-sort { order:3; }
-            .yuiko-favorite-gesture { order:2; }
-            .yuiko-sort:hover, .yuiko-favorite-gesture:hover { background:var(--yk-hover); color:var(--yk-text); }
+            .yuiko-sort:hover { background:var(--yk-hover); color:var(--yk-text); }
             .yuiko-preview { position:fixed; z-index:1000000; display:none; padding:10px; border:1px solid var(--yk-border); border-radius:8px; background:var(--yk-bg); box-shadow:var(--yk-shadow); pointer-events:none; }
             .yuiko-preview.is-visible { display:flex; }
             .yuiko-preview img { display:block; width:${this.previewSize}px; height:${this.previewSize}px; object-fit:contain; }
@@ -650,19 +647,28 @@ module.exports = class YuikoStickers {
         this.render();
     }
 
+    capturePanelScroll() {
+        const positions = [...(this.panel?.querySelectorAll('.yuiko-grid, .yuiko-groupbar, .yuiko-manage') || [])]
+            .map(element => ({element, top:element.scrollTop, left:element.scrollLeft}));
+        return () => {
+            for (const {element, top, left} of positions) {
+                element.scrollTop = top;
+                element.scrollLeft = left;
+            }
+        };
+    }
+
     renderGroupControls() {
         if (!this.panel) return;
+        const restoreScroll = this.capturePanelScroll();
         const bar = this.panel.querySelector('.yuiko-groupbar');
         const management = this.panel.querySelector('.yuiko-manage');
-        const scrollTop = bar.scrollTop;
-        const managementScrollTop = management.scrollTop;
         bar.replaceChildren();
         const all = document.createElement('div'); all.setAttribute('role', 'button'); all.tabIndex = 0; all.className = 'yuiko-group-button'+(this.selectedGroupId === null ? ' is-active' : ''); all.dataset.groupId = 'all'; all.title = `전체 (${this.enabledGroupIds?.length || 0})`; all.classList.add('has-thumb'); const allIcon = document.createElement('img'); allIcon.src = this.iconURL; allIcon.alt = '전체'; all.appendChild(allIcon); bar.appendChild(all);
         for (const group of this.groups.filter(group => this.enabledGroupIds?.includes(group.id))) { const button = document.createElement('div'); button.setAttribute('role', 'button'); button.tabIndex = 0; button.className = 'yuiko-group-button'+(this.selectedGroupId === group.id ? ' is-active' : ''); button.dataset.groupId = group.id; button.title = `${group.name} (${group.count}) · 드래그해서 순서 변경`; button.classList.add('has-thumb'); const thumb = this.createGroupThumb(group, ''); if (thumb) button.appendChild(thumb); else { const letter = document.createElement('span'); letter.className = 'yuiko-group-letter'; letter.textContent = group.name.trim().charAt(0) || '?'; button.appendChild(letter); } bar.appendChild(button); }
-        bar.scrollTop = scrollTop;
         management.replaceChildren();
         this.groups.forEach((group, index) => { const row = document.createElement('div'); row.className = 'yuiko-manage-row'; row.dataset.groupId = group.id; const handle = document.createElement('span'); handle.className = 'yuiko-drag-handle'; handle.textContent = '⠿'; handle.title = '드래그해서 순서 변경'; row.appendChild(handle); const label = document.createElement('label'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.dataset.groupId = group.id; checkbox.checked = this.enabledGroupIds?.includes(group.id); label.appendChild(checkbox); const thumb = this.createGroupThumb(group, 'yuiko-manage-thumb'); if (thumb) label.appendChild(thumb); const text = document.createElement('span'); text.textContent = `${group.name} (${group.count})`; label.appendChild(text); const up = document.createElement('button'); up.className = 'yuiko-move'; up.type = 'button'; up.dataset.groupId = group.id; up.dataset.dir = '-1'; up.textContent = '▲'; up.title = '위로'; up.disabled = index === 0; const down = document.createElement('button'); down.className = 'yuiko-move'; down.type = 'button'; down.dataset.groupId = group.id; down.dataset.dir = '1'; down.textContent = '▼'; down.title = '아래로'; down.disabled = index === this.groups.length-1; row.append(label, up, down); management.appendChild(row); });
-        management.scrollTop = managementScrollTop;
+        restoreScroll();
     }
 
     createGroupPreview() {
@@ -736,7 +742,7 @@ module.exports = class YuikoStickers {
         const findItem = target => { const url = target?.closest?.('.yuiko-item')?.dataset.url; return this.itemByUrl.get(url) || this.knownItems.get(url) || null; };
         grid.addEventListener('pointerdown', event => {
             this.cancelLongPress(); this.suppressEmojiClick = false;
-            if (event.button !== 0 || this.favoriteGesture !== 'longPress') return;
+            if (event.button !== 0) return;
             const item = findItem(event.target); if (!item) return;
             this.longPressTimer = setTimeout(() => {
                 this.longPressTimer = null;
@@ -761,17 +767,13 @@ module.exports = class YuikoStickers {
         grid.addEventListener('click', event => {
             if (this.suppressEmojiClick) { event.preventDefault(); event.stopPropagation(); this.suppressEmojiClick = false; return; }
             if (this.suppressNextClick) return;
-            if (event.target.closest('.yuiko-favorite-gesture')) {
-                event.preventDefault(); event.stopPropagation();
-                return this.setFavoriteGesture(this.favoriteGesture === 'longPress' ? 'shiftRightClick' : 'longPress');
-            }
             if (event.target.closest('.yuiko-sort')) return this.toggleSort();
             const item = findItem(event.target); if (item) this.useEmoji(item);
         });
         grid.addEventListener('contextmenu', event => {
             const item = findItem(event.target); if (!item) return;
             event.preventDefault(); event.stopPropagation(); this.cancelLongPress();
-            if (this.favoriteGesture === 'shiftRightClick' && event.shiftKey) return this.toggleFavorite(item);
+            if (event.shiftKey) return this.toggleFavorite(item);
             this.queuedItems.push(item); this.updateQueueStatus(true);
         });
         grid.addEventListener('mousemove', event => { if (this.dragActive) return; const item = findItem(event.target); if (item) this.showPreview(item, event); else this.hidePreview(); });
@@ -779,21 +781,14 @@ module.exports = class YuikoStickers {
     }
 
     cancelLongPress() { clearTimeout(this.longPressTimer); this.longPressTimer = null; }
-    favoriteGestureLabel() { return this.favoriteGesture === 'shiftRightClick' ? 'Shift+우클릭' : '1초 이상 길게 누르기'; }
-    loadFavoriteGesture() { this.favoriteGesture = BdApi.Data.load(this.pluginName, 'favoriteGesture') === 'shiftRightClick' ? 'shiftRightClick' : 'longPress'; }
-    setFavoriteGesture(value) {
-        this.cancelLongPress();
-        this.favoriteGesture = value === 'shiftRightClick' ? value : 'longPress';
-        BdApi.Data.save(this.pluginName, 'favoriteGesture', this.favoriteGesture);
-        this.rerender();
-    }
     updateQueueStatus(scrollToEnd = false) {
         if (!this.queueStatus) return;
+        const restoreScroll = this.capturePanelScroll();
         const previousScroll = this.queueStatus.querySelector('.yuiko-queue-list')?.scrollLeft || 0;
         this.queueStatus.replaceChildren();
         this.queueStatus.classList.toggle('has-items', this.queuedItems.length > 0);
         this.queueStatus.removeAttribute('title');
-        if (!this.queuedItems.length) return;
+        if (!this.queuedItems.length) { restoreScroll(); return; }
         const header = document.createElement('div'); header.className = 'yuiko-queue-header';
         const label = document.createElement('span'); label.textContent = `전송 대기 ${this.queuedItems.length}개 · 이모지 좌클릭으로 함께 전송`;
         const clear = document.createElement('button'); clear.className = 'yuiko-queue-clear'; clear.type = 'button'; clear.textContent = '전체 비우기';
@@ -812,6 +807,7 @@ module.exports = class YuikoStickers {
         });
         this.queueStatus.append(header, list);
         list.scrollLeft = scrollToEnd ? list.scrollWidth : previousScroll;
+        restoreScroll();
     }
 
     showPreview(item, event) {
@@ -853,8 +849,9 @@ module.exports = class YuikoStickers {
 
     render(filter = '') {
         if (!this.grid) return;
+        const restoreScroll = this.capturePanelScroll();
         this.cancelLongPress();
-        this.hidePreview(); this.grid.replaceChildren();
+        this.hidePreview();
         const fragment = document.createDocumentFragment();
         const query = filter.trim().toLowerCase();
         const items = this.items.filter(item => !query || item.name.toLowerCase().includes(query));
@@ -863,22 +860,19 @@ module.exports = class YuikoStickers {
         if (favoriteItems.length) { fragment.appendChild(this.createSection(`즐겨찾기 ${favoriteItems.length}`)); favoriteItems.forEach(item => fragment.appendChild(this.createItem(item, 'fav'))); }
         fragment.appendChild(this.createSection(`${this.selectedGroupId === null ? '선택 그룹' : this.groups.find(group => group.id === this.selectedGroupId)?.name || '그룹'} · 전체 ${items.length}`, true));
         this.sortItems(items).forEach(item => fragment.appendChild(this.createItem(item)));
-        this.grid.appendChild(fragment);
+        this.grid.replaceChildren(fragment);
         this.clearStatusError();
         this.status.textContent = this.selectedGroupId === null && !this.enabledGroupIds?.length ? '표시할 그룹이 없습니다. ⚙에서 그룹을 선택하세요.' : '';
         this.updateQueueStatus();
+        restoreScroll();
     }
     createSection(label, withSort = false) {
         const section = document.createElement('div'); section.className = 'yuiko-section';
         const text = document.createElement('span'); text.textContent = label; section.appendChild(text);
         if (withSort) {
-            const gesture = document.createElement('button'); gesture.className = 'yuiko-favorite-gesture'; gesture.type = 'button';
-            gesture.textContent = this.favoriteGesture === 'shiftRightClick' ? '☆ Shift+우클릭' : '☆ 1초 누르기';
-            gesture.title = `즐겨찾기: ${this.favoriteGestureLabel()} · 클릭하면 방식 변경`;
-            gesture.setAttribute('aria-label', gesture.title);
             const sort = document.createElement('button'); sort.className = 'yuiko-sort'; sort.type = 'button';
             sort.textContent = this.sortByRecent ? '🕒 최근순' : '기본순';
-            section.append(gesture, sort);
+            section.append(sort);
         }
         return section;
     }
