@@ -80,4 +80,9 @@ function harness(t, options = {}) {
     return {plugin, window, document:window.document, api, items, data, writes, toasts, logs, timers, files, installedPath, versionedSource, advance, fire, mount, itemNode, fakeFs, now:() => now};
 }
 
-module.exports = {harness, deferred, flush};
+function advertiseRefs(commit, extra = '') {
+    const packet = text => (Buffer.byteLength(text) + 4).toString(16).padStart(4, '0') + text;
+    return packet('# service=git-upload-pack\n') + '0000' + packet(`${commit} HEAD\0symref=HEAD:refs/heads/main\n`) + extra + packet(`${commit} refs/heads/main\n`) + '0000';
+}
+
+module.exports = {harness, deferred, flush, advertiseRefs};

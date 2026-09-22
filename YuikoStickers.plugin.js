@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.4
+ * @version 2.17.5
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -23,7 +23,8 @@ module.exports = class YuikoStickers {
         this.unbindGridPress = null;
         this.version = this.getVersion();
 
-        // 업데이트 확인 주소. GitHub API가 우선(캐시 1분, IP당 시간당 60회 제한), 실패하면 raw 주소로 대체(CDN 캐시 최대 5분 — 쿼리스트링으로도 안 뚫림)
+        // Git 참조로 최신 커밋을 확인하고 해당 커밋의 파일만 받는다.
+        this.updateRefsURL = "https://github.com/awizc/YuikoStickers-plugin.git/info/refs?service=git-upload-pack";
         this.updateAPIURL = "https://api.github.com/repos/awizc/YuikoStickers-plugin/contents/YuikoStickers.plugin.js?ref=main";
         this.updateURL = "https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js";
         // 실행 중에는 매 정시(00분)마다 GitHub 버전을 다시 확인
@@ -350,24 +351,59 @@ module.exports = class YuikoStickers {
      * (같거나 낮으면 무시 → 로컬에서 먼저 버전을 올려도 GitHub 구버전에 덮어써지지 않음)
      * BetterDiscord가 plugins 폴더 변경을 감지해 자동으로 다시 로드함.
      */
-    /**
-     * GitHub에서 플러그인 소스를 받아옴. API → raw 순서로 시도
-     */
-    async fetchPluginSource() {
-        if (this.updateAPIURL) {
-            try {
-                const url = new URL(this.updateAPIURL); url.searchParams.set('t', Date.now());
-                const response = await BdApi.Net.fetch(url.href, {cache:'no-store', headers:{Accept:'application/vnd.github.raw+json'}});
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const source = await response.text();
-                if (!source.match(/^\s*\*\s*@version\s+(\S+)/m) || !source.includes('module.exports')) throw new Error('GitHub API가 플러그인 소스를 반환하지 않음');
-                return source;
-            } catch (error) { console.warn('[YuikoStickers] GitHub API 요청 실패, raw 주소로 재시도:', error.message); }
+    /** Git smart HTTP v0의 pkt-line에서 main의 커밋만 읽는다. 길이는 문자 수가 아닌 바이트 수. */
+    readUpdateCommit(advertisement) {
+        const bytes = new TextEncoder().encode(advertisement);
+        const decoder = new TextDecoder();
+        let offset = 0, first = true, commit = null;
+        while (offset < bytes.length) {
+            const header = decoder.decode(bytes.subarray(offset, offset + 4));
+            if (!/^[0-9a-f]{4}$/i.test(header)) throw new Error('Git 참조 응답 길이 오류');
+            const length = parseInt(header, 16);
+            if (length === 0) { offset += 4; continue; }
+            if (length < 4 || length > 65520 || offset + length > bytes.length) throw new Error('Git 참조 응답이 잘렸거나 올바르지 않음');
+            const line = decoder.decode(bytes.subarray(offset + 4, offset + length));
+            offset += length;
+            if (first) {
+                if (line !== '# service=git-upload-pack\n') throw new Error('Git 참조 응답 형식 오류');
+                first = false;
+                continue;
+            }
+            const match = line.split('\0')[0].match(/^([0-9a-f]{40}) refs\/heads\/main\n?$/);
+            if (match) {
+                if (commit && commit !== match[1]) throw new Error('Git main 참조가 중복됨');
+                commit = match[1];
+            }
         }
-        const url = this.updateURL + (this.updateURL.includes('?') ? '&' : '?') + 't=' + Date.now();
-        const response = await BdApi.Net.fetch(url, {cache:'no-store'});
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.text();
+        if (!commit || /^0+$/.test(commit)) throw new Error('GitHub에서 main 커밋을 확인하지 못함');
+        return commit;
+    }
+
+    /** 최신 참조 확인이 실패하면 오래된 main 캐시로 최신 여부를 판단하지 않는다. */
+    async fetchPluginSource() {
+        const options = {cache:'no-store', headers:{'Cache-Control':'no-cache', Pragma:'no-cache'}};
+        const refs = await BdApi.Net.fetch(this.updateRefsURL, options);
+        if (!refs.ok) throw new Error(`GitHub 최신 커밋 확인 실패: HTTP ${refs.status}`);
+        const commit = this.readUpdateCommit(await refs.text());
+        const rawURL = new URL(this.updateURL);
+        const parts = rawURL.pathname.split('/');
+        parts[3] = commit;
+        rawURL.pathname = parts.join('/'); rawURL.search = '';
+        const fetchSource = async (url, init) => {
+            const response = await BdApi.Net.fetch(url, init);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const source = await response.text();
+            if (!source.match(/^\s*\*\s*@version\s+(\S+)/m) || !source.includes('module.exports')) throw new Error('플러그인 파일 형식이 아님');
+            return source;
+        };
+        try {
+            return await fetchSource(rawURL.href, options);
+        } catch (error) {
+            if (!this.updateAPIURL) throw error;
+            console.warn('[YuikoStickers] 커밋 파일 다운로드 실패, 같은 커밋의 API 주소로 재시도:', error.message);
+            const apiURL = new URL(this.updateAPIURL); apiURL.searchParams.set('ref', commit);
+            return await fetchSource(apiURL.href, {cache:'no-store', headers:{...options.headers, Accept:'application/vnd.github.raw+json'}});
+        }
     }
 
     async checkPluginUpdate(notifyResult = false) {

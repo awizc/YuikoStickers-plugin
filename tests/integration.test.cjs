@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {harness, flush} = require('./helpers.cjs');
+const {harness, flush, advertiseRefs} = require('./helpers.cjs');
 
 test('실제 start → 버튼 → 패널 → 선택 → 전송 → stop → start 경로', async t => {
     const h=harness(t,{data:{enabledGroups:[1],groupOrder:[1],favorites:['https://example.test/1.png'],favoriteGesture:'shiftRightClick'}});
@@ -11,7 +11,8 @@ test('실제 start → 버튼 → 패널 → 선택 → 전송 → stop → star
     const requests=[];
     h.api.Net.fetch=async url=>{
         requests.push(url);
-        if(url.startsWith('https://api.github.com/')) return {ok:true,text:async()=>h.versionedSource('2.17.3')};
+        if(url.includes('/info/refs?')) return {ok:true,text:async()=>advertiseRefs('a'.repeat(40))};
+        if(url.startsWith('https://raw.githubusercontent.com/')) return {ok:true,text:async()=>h.versionedSource('2.17.3')};
         const endpoint=new URL(url).pathname;
         if(endpoint.endsWith('/groups')) return {ok:true,json:async()=>[{id:1,name:'첫 그룹',count:2}]};
         if(endpoint.endsWith('/latest')) return {ok:true,json:async()=>({datetime:'test-date'})};
@@ -34,7 +35,7 @@ test('실제 start → 버튼 → 패널 → 선택 → 전송 → stop → star
     p.start(); await flush();
     assert.equal(h.document.querySelectorAll('.yuiko-button').length,1); assert.equal(p.favoriteGesture,'shiftRightClick'); assert.equal(p.favorites.size,1);
     assert.deepEqual(p.recent,[h.items[0].url,h.items[1].url]);
-    assert.equal(requests.filter(url=>url.startsWith('https://api.github.com/')).length,2);
+    assert.equal(requests.filter(url=>url.includes('/info/refs?')).length,2);
     p.stop(); await flush(); assert.equal(h.timers.size,0);
 });
 
