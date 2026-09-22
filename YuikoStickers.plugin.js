@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.6
+ * @version 2.17.7
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -230,13 +230,13 @@ module.exports = class YuikoStickers {
             .yuiko-grid::-webkit-scrollbar-thumb, .yuiko-groupbar::-webkit-scrollbar-thumb, .yuiko-manage::-webkit-scrollbar-thumb { background:var(--yk-scroll); border-radius:4px; border:2px solid transparent; background-clip:padding-box; }
             .yuiko-grid::-webkit-scrollbar-thumb:hover, .yuiko-groupbar::-webkit-scrollbar-thumb:hover, .yuiko-manage::-webkit-scrollbar-thumb:hover { background:var(--yk-scroll-hover); background-clip:padding-box; }
             .yuiko-grid::-webkit-scrollbar-corner, .yuiko-groupbar::-webkit-scrollbar-corner { background:transparent; }
-            .yuiko-group-preview { position:fixed; z-index:1000001; display:none; flex-direction:column; gap:10px; width:522px; max-width:calc(100vw - 16px); box-sizing:border-box; padding:12px; border:1px solid var(--yk-border); border-radius:8px; background:var(--yk-bg); color:var(--yk-text); box-shadow:var(--yk-shadow); pointer-events:none; }
+            .yuiko-group-preview { position:fixed; z-index:1000001; display:none; flex-direction:column; gap:12px; width:280px; max-width:calc(100vw - 16px); box-sizing:border-box; padding:12px; overflow:hidden; border:1px solid var(--yk-border); border-radius:8px; background:var(--yk-bg); color:var(--yk-text); box-shadow:var(--yk-shadow); pointer-events:none; }
             .yuiko-group-preview.is-visible { display:flex; }
-            .yuiko-group-preview-title { display:flex; align-items:center; gap:8px; font-size:14px; font-weight:600; line-height:1.6; overflow-x:clip; overflow-y:visible; white-space:nowrap; text-overflow:ellipsis; }
+            .yuiko-group-preview-title { display:flex; align-items:center; gap:8px; min-height:24px; flex-shrink:0; font-size:14px; font-weight:600; line-height:1.6; overflow-wrap:anywhere; }
             .yuiko-group-preview-title img { width:24px; height:24px; object-fit:contain; border-radius:3px; flex-shrink:0; }
-            .yuiko-group-preview-grid { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:8px; }
-            .yuiko-group-preview-grid img { width:100%; height:auto; aspect-ratio:1; object-fit:contain; box-sizing:border-box; padding:4px; border-radius:6px; background:var(--yk-bg2); }
-            .yuiko-group-preview-empty { color:var(--yk-muted); font-size:12px; line-height:1.6; }
+            .yuiko-group-preview-grid { display:grid; flex:1; min-height:0; grid-template-columns:repeat(3,minmax(0,1fr)); grid-template-rows:repeat(4,minmax(0,1fr)); gap:8px; }
+            .yuiko-group-preview-grid img { width:100%; height:100%; min-height:0; object-fit:contain; box-sizing:border-box; padding:4px; border-radius:6px; background:var(--yk-bg2); }
+            .yuiko-group-preview-empty { grid-column:1 / -1; color:var(--yk-muted); font-size:12px; line-height:1.6; }
             .yuiko-status { padding:7px 10px; border-top:1px solid var(--yk-border); color:var(--yk-muted); font-size:12px; flex-shrink:0; line-height:1.5; }
             .yuiko-status:empty { display:none; }
             .yuiko-status.is-error { color:#f23f43; cursor:pointer; }
@@ -697,11 +697,15 @@ module.exports = class YuikoStickers {
     }
     positionGroupPreview(row) {
         if (!this.groupPreview || !this.panel || !row.isConnected) return;
-        const popup = this.groupPreview, panelRect = this.panel.getBoundingClientRect(), rowRect = row.getBoundingClientRect(), margin = 8;
-        const width = popup.offsetWidth || Math.min(522, innerWidth - margin * 2), height = popup.offsetHeight || 220;
-        // 패널 오른쪽에 자리가 있으면 오른쪽, 없으면 왼쪽
-        let left = panelRect.right + margin; if (left + width > innerWidth - margin) left = panelRect.left - width - margin;
-        let top = rowRect.top; if (top + height > innerHeight - margin) top = innerHeight - height - margin;
+        const popup = this.groupPreview, panelRect = this.panel.getBoundingClientRect(), margin = 8;
+        const bodyRect = this.panel.querySelector('.yuiko-body').getBoundingClientRect();
+        const width = Math.min(280, Math.max(0, innerWidth - margin * 2));
+        const top = Math.max(margin, Math.min(bodyRect.top, innerHeight - margin));
+        const height = Math.min(480, Math.max(0, Math.min(panelRect.bottom, innerHeight - margin) - top));
+        // 행 위치나 이미지 로딩 상태와 무관하게 패널 본문 옆에 고정한다.
+        let left = panelRect.left - width - margin;
+        if (left < margin) left = panelRect.right + margin;
+        popup.style.width = `${width}px`; popup.style.height = `${height}px`;
         popup.style.left = `${Math.min(Math.max(margin, left), Math.max(margin, innerWidth - width - margin))}px`;
         popup.style.top = `${Math.max(margin, top)}px`;
     }
