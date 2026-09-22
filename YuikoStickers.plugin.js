@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.5
+ * @version 2.17.6
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -230,12 +230,12 @@ module.exports = class YuikoStickers {
             .yuiko-grid::-webkit-scrollbar-thumb, .yuiko-groupbar::-webkit-scrollbar-thumb, .yuiko-manage::-webkit-scrollbar-thumb { background:var(--yk-scroll); border-radius:4px; border:2px solid transparent; background-clip:padding-box; }
             .yuiko-grid::-webkit-scrollbar-thumb:hover, .yuiko-groupbar::-webkit-scrollbar-thumb:hover, .yuiko-manage::-webkit-scrollbar-thumb:hover { background:var(--yk-scroll-hover); background-clip:padding-box; }
             .yuiko-grid::-webkit-scrollbar-corner, .yuiko-groupbar::-webkit-scrollbar-corner { background:transparent; }
-            .yuiko-group-preview { position:fixed; z-index:1000001; display:none; flex-direction:column; gap:6px; width:264px; padding:8px; border:1px solid var(--yk-border); border-radius:8px; background:var(--yk-bg); color:var(--yk-text); box-shadow:var(--yk-shadow); pointer-events:none; }
+            .yuiko-group-preview { position:fixed; z-index:1000001; display:none; flex-direction:column; gap:10px; width:522px; max-width:calc(100vw - 16px); box-sizing:border-box; padding:12px; border:1px solid var(--yk-border); border-radius:8px; background:var(--yk-bg); color:var(--yk-text); box-shadow:var(--yk-shadow); pointer-events:none; }
             .yuiko-group-preview.is-visible { display:flex; }
-            .yuiko-group-preview-title { display:flex; align-items:center; gap:6px; font-size:12px; font-weight:600; line-height:1.6; overflow-x:clip; overflow-y:visible; white-space:nowrap; text-overflow:ellipsis; }
-            .yuiko-group-preview-title img { width:20px; height:20px; object-fit:contain; border-radius:3px; flex-shrink:0; }
-            .yuiko-group-preview-grid { display:grid; grid-template-columns:repeat(6,38px); gap:6px; }
-            .yuiko-group-preview-grid img { width:38px; height:38px; object-fit:contain; box-sizing:border-box; padding:3px; border-radius:6px; background:var(--yk-bg2); }
+            .yuiko-group-preview-title { display:flex; align-items:center; gap:8px; font-size:14px; font-weight:600; line-height:1.6; overflow-x:clip; overflow-y:visible; white-space:nowrap; text-overflow:ellipsis; }
+            .yuiko-group-preview-title img { width:24px; height:24px; object-fit:contain; border-radius:3px; flex-shrink:0; }
+            .yuiko-group-preview-grid { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:8px; }
+            .yuiko-group-preview-grid img { width:100%; height:auto; aspect-ratio:1; object-fit:contain; box-sizing:border-box; padding:4px; border-radius:6px; background:var(--yk-bg2); }
             .yuiko-group-preview-empty { color:var(--yk-muted); font-size:12px; line-height:1.6; }
             .yuiko-status { padding:7px 10px; border-top:1px solid var(--yk-border); color:var(--yk-muted); font-size:12px; flex-shrink:0; line-height:1.5; }
             .yuiko-status:empty { display:none; }
@@ -655,12 +655,14 @@ module.exports = class YuikoStickers {
         const bar = this.panel.querySelector('.yuiko-groupbar');
         const management = this.panel.querySelector('.yuiko-manage');
         const scrollTop = bar.scrollTop;
+        const managementScrollTop = management.scrollTop;
         bar.replaceChildren();
         const all = document.createElement('div'); all.setAttribute('role', 'button'); all.tabIndex = 0; all.className = 'yuiko-group-button'+(this.selectedGroupId === null ? ' is-active' : ''); all.dataset.groupId = 'all'; all.title = `전체 (${this.enabledGroupIds?.length || 0})`; all.classList.add('has-thumb'); const allIcon = document.createElement('img'); allIcon.src = this.iconURL; allIcon.alt = '전체'; all.appendChild(allIcon); bar.appendChild(all);
         for (const group of this.groups.filter(group => this.enabledGroupIds?.includes(group.id))) { const button = document.createElement('div'); button.setAttribute('role', 'button'); button.tabIndex = 0; button.className = 'yuiko-group-button'+(this.selectedGroupId === group.id ? ' is-active' : ''); button.dataset.groupId = group.id; button.title = `${group.name} (${group.count}) · 드래그해서 순서 변경`; button.classList.add('has-thumb'); const thumb = this.createGroupThumb(group, ''); if (thumb) button.appendChild(thumb); else { const letter = document.createElement('span'); letter.className = 'yuiko-group-letter'; letter.textContent = group.name.trim().charAt(0) || '?'; button.appendChild(letter); } bar.appendChild(button); }
         bar.scrollTop = scrollTop;
         management.replaceChildren();
         this.groups.forEach((group, index) => { const row = document.createElement('div'); row.className = 'yuiko-manage-row'; row.dataset.groupId = group.id; const handle = document.createElement('span'); handle.className = 'yuiko-drag-handle'; handle.textContent = '⠿'; handle.title = '드래그해서 순서 변경'; row.appendChild(handle); const label = document.createElement('label'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.dataset.groupId = group.id; checkbox.checked = this.enabledGroupIds?.includes(group.id); label.appendChild(checkbox); const thumb = this.createGroupThumb(group, 'yuiko-manage-thumb'); if (thumb) label.appendChild(thumb); const text = document.createElement('span'); text.textContent = `${group.name} (${group.count})`; label.appendChild(text); const up = document.createElement('button'); up.className = 'yuiko-move'; up.type = 'button'; up.dataset.groupId = group.id; up.dataset.dir = '-1'; up.textContent = '▲'; up.title = '위로'; up.disabled = index === 0; const down = document.createElement('button'); down.className = 'yuiko-move'; down.type = 'button'; down.dataset.groupId = group.id; down.dataset.dir = '1'; down.textContent = '▼'; down.title = '아래로'; down.disabled = index === this.groups.length-1; row.append(label, up, down); management.appendChild(row); });
+        management.scrollTop = managementScrollTop;
     }
 
     createGroupPreview() {
@@ -696,11 +698,12 @@ module.exports = class YuikoStickers {
     positionGroupPreview(row) {
         if (!this.groupPreview || !this.panel || !row.isConnected) return;
         const popup = this.groupPreview, panelRect = this.panel.getBoundingClientRect(), rowRect = row.getBoundingClientRect(), margin = 8;
-        const width = popup.offsetWidth || 264, height = popup.offsetHeight || 120;
+        const width = popup.offsetWidth || Math.min(522, innerWidth - margin * 2), height = popup.offsetHeight || 220;
         // 패널 오른쪽에 자리가 있으면 오른쪽, 없으면 왼쪽
         let left = panelRect.right + margin; if (left + width > innerWidth - margin) left = panelRect.left - width - margin;
         let top = rowRect.top; if (top + height > innerHeight - margin) top = innerHeight - height - margin;
-        popup.style.left = `${Math.max(margin, left)}px`; popup.style.top = `${Math.max(margin, top)}px`;
+        popup.style.left = `${Math.min(Math.max(margin, left), Math.max(margin, innerWidth - width - margin))}px`;
+        popup.style.top = `${Math.max(margin, top)}px`;
     }
     hideGroupPreview() { this.groupPreviewId = null; this.groupPreview?.classList.remove('is-visible'); }
     /**
