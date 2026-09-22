@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.3
+ * @version 2.17.4
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -32,6 +32,12 @@ module.exports = class YuikoStickers {
         this.lastPluginUpdateCheck = 0;
         this.updated = false;
         this.running = false;
+        // 껐다 켜기 전의 비동기 응답이 새 실행의 상태에 섞이지 않도록 구분한다.
+        this.sessionId = 0;
+        this.groupsLoadToken = 0;
+        this.pendingSendTimers = new Set();
+        this.dragCleanups = new Set();
+        this.dragResetTimer = null;
 
         this.groups = [];
         // 그룹 대표 이미지 (그룹 id → 그룹의 첫 번째 이모지 URL). 그룹 탭에 이름 대신 표시, BdApi.Data에 저장
@@ -79,6 +85,8 @@ module.exports = class YuikoStickers {
     }
 
     start() {
+        if (this.running) return;
+        this.sessionId++;
         this.running = true;
         this.updated = false;
         this.checkPluginUpdate(true);
@@ -96,22 +104,39 @@ module.exports = class YuikoStickers {
     }
 
     stop() {
+        this.running = false;
+        this.sessionId++;
+        this.loadToken++;
+        this.groupsLoadToken++;
+        this.updateInFlight = false;
         this.cancelLongPress();
+        for (const timer of this.pendingSendTimers) clearTimeout(timer);
+        this.pendingSendTimers.clear();
+        for (const cleanup of this.dragCleanups) cleanup();
+        this.dragCleanups.clear();
+        clearTimeout(this.dragResetTimer); this.dragResetTimer = null;
+        this.dragActive = this.suppressNextClick = this.suppressEmojiClick = false;
+        this.hideGroupPreview();
         this.unbindGridPress?.(); this.unbindGridPress = null;
         this.queuedItems = []; this.queueStatus = null;
-        this.running = false;
         this.observer?.disconnect();
         this.observer = null;
         if (this.addButtonTimer) clearTimeout(this.addButtonTimer);
+        this.addButtonTimer = null;
         if (this.updateTimer) { clearTimeout(this.updateTimer); this.updateTimer = null; }
         this.panel?.remove();
         this.button?.remove();
         this.preview?.remove();
         this.groupPreview?.remove();
         this.panel = this.button = this.preview = this.groupPreview = null;
+        this.previewImage = null;
         this.grid = this.status = this.searchInput = this.composer = this.savedSelection = null;
         this.unbindOutsideClick();
         BdApi.DOM.removeStyle(this.pluginName);
+    }
+
+    isCurrentSession(sessionId) {
+        return this.running && this.sessionId === sessionId;
     }
 
     addStyles() {
@@ -235,8 +260,12 @@ module.exports = class YuikoStickers {
     }
 
     scheduleAddButton() {
-        if (this.addButtonTimer || this.button?.isConnected) return;
-        this.addButtonTimer = setTimeout(() => { this.addButtonTimer = null; this.addButton(); }, 100);
+        if (!this.running || this.addButtonTimer || this.button?.isConnected) return;
+        const sessionId = this.sessionId;
+        this.addButtonTimer = setTimeout(() => {
+            this.addButtonTimer = null;
+            if (this.isCurrentSession(sessionId)) this.addButton();
+        }, 100);
     }
 
     findComposer() {
@@ -291,16 +320,19 @@ module.exports = class YuikoStickers {
      * 다음 정시(00분 00초)에 업데이트 확인을 예약하고, 실행 후 다시 그 다음 정시로 예약
      */
     scheduleHourlyUpdateCheck() {
+        if (!this.running || this.updated) return;
         if (this.updateTimer) clearTimeout(this.updateTimer);
+        const sessionId = this.sessionId;
         const now = new Date();
         const next = new Date(now); next.setHours(now.getHours()+1, 0, 0, 0);
         // 타이머가 정시 직전에 깨어난 경우(1초 미만 남음) 같은 정시에 두 번 확인하지 않도록 한 시간 뒤로
         if (next-now < 1000) next.setHours(next.getHours()+1);
         this.updateTimer = setTimeout(async () => {
+            if (!this.isCurrentSession(sessionId)) return;
             this.updateTimer = null;
             await this.checkPluginUpdate();
             // 플러그인이 꺼졌거나 업데이트로 파일이 교체됐으면 재예약하지 않음 (BetterDiscord가 새 버전을 다시 로드함)
-            if (this.running && !this.updated) this.scheduleHourlyUpdateCheck();
+            if (this.isCurrentSession(sessionId) && !this.updated) this.scheduleHourlyUpdateCheck();
         }, next-now);
     }
 
@@ -341,9 +373,11 @@ module.exports = class YuikoStickers {
     async checkPluginUpdate(notifyResult = false) {
         if ((!this.updateURL && !this.updateAPIURL) || this.updateInFlight || !this.running || this.updated) return;
         this.updateInFlight = true;
+        const sessionId = this.sessionId;
         this.lastPluginUpdateCheck = Date.now();
         try {
             const source = await this.fetchPluginSource();
+            if (!this.isCurrentSession(sessionId)) return;
             const remoteVersion = source.match(/^\s*\*\s*@version\s+(\S+)/m)?.[1];
             if (!remoteVersion || !source.includes('module.exports')) throw new Error('플러그인 파일 형식이 아님');
             const fs = require('fs'), path = require('path');
@@ -365,8 +399,10 @@ module.exports = class YuikoStickers {
             if (this.updateTimer) { clearTimeout(this.updateTimer); this.updateTimer = null; }
         } catch (error) {
             console.warn('[YuikoStickers] 업데이트 확인 실패:', error.message);
-            if (this.running) BdApi.UI.showToast(`YuikoStickers 업데이트 확인 실패: ${error.message}`, {type:'error'});
-        } finally { this.updateInFlight = false; }
+            if (this.isCurrentSession(sessionId)) BdApi.UI.showToast(`YuikoStickers 업데이트 확인 실패: ${error.message}`, {type:'error'});
+        } finally {
+            if (this.sessionId === sessionId) this.updateInFlight = false;
+        }
     }
 
     fetchWithVersion(url) {
@@ -376,11 +412,18 @@ module.exports = class YuikoStickers {
     }
 
     async loadGroups(force = false) {
+        const sessionId = this.sessionId;
+        const token = ++this.groupsLoadToken;
+        const isCurrent = () => this.isCurrentSession(sessionId) && token === this.groupsLoadToken;
         try {
             const response = await this.fetchWithVersion(this.apiBase+'groups');
+            if (!isCurrent()) return false;
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const groups = await response.json();
-            this.groups = (Array.isArray(groups) ? groups : []).map(group => ({id:Number(group.id), name:String(group.name || `그룹 ${group.id}`), description:String(group.description || ''), count:Number(group.count || 0)}));
+            if (!isCurrent()) return false;
+            // 오류 객체를 빈 그룹 목록으로 취급하면 저장된 즐겨찾기가 삭제될 수 있다.
+            if (!Array.isArray(groups) || groups.some(group => !group || Array.isArray(group) || !Number.isFinite(Number(group.id)))) throw new Error('올바르지 않은 그룹 목록 응답');
+            this.groups = groups.map(group => ({id:Number(group.id), name:String(group.name || `그룹 ${group.id}`), description:String(group.description || ''), count:Number(group.count || 0)}));
             this.applyGroupOrder();
             const available = new Set(this.groups.map(group => group.id));
             for (const [url, item] of this.knownItems) if (!available.has(item.groupId)) this.knownItems.delete(url);
@@ -389,7 +432,9 @@ module.exports = class YuikoStickers {
             if (this.selectedGroupId !== null && !available.has(this.selectedGroupId)) this.selectedGroupId = null;
             this.saveGroupSettings();
             await this.loadGroupItems();
+            if (!isCurrent()) return false;
             await this.loadGroupThumbsFromServer();
+            if (!isCurrent()) return false;
             if (this.panel) {
                 this.renderGroupControls();
                 this.render();
@@ -397,6 +442,7 @@ module.exports = class YuikoStickers {
             this.saveCache();
             return true;
         } catch (error) {
+            if (!isCurrent()) return false;
             console.warn('[YuikoStickers] 그룹 로딩 실패:', error);
             this.setStatusError('그룹을 불러오지 못했습니다. 클릭하면 다시 시도합니다.');
             return false;
@@ -404,26 +450,51 @@ module.exports = class YuikoStickers {
     }
 
     async loadGroupItems() {
+        const sessionId = this.sessionId;
         const token = ++this.loadToken;
+        const isCurrent = () => this.isCurrentSession(sessionId) && token === this.loadToken;
         const ids = this.selectedGroupId === null ? this.sortIdsByGroupOrder(this.enabledGroupIds || []) : [this.selectedGroupId];
         const groupMap = new Map(this.groups.map(group => [group.id, group]));
-        const responses = await Promise.all(ids.map(async id => {
-            const response = await this.fetchWithVersion(this.apiBase+'group/'+id);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const items = await response.json();
-            return (Array.isArray(items) ? items : []).map(item => ({...item, name:String(item.word || item.name || ''), groupId:id, groupName:groupMap.get(id)?.name || `그룹 ${id}`, url:item.url || `https://snow.modaweb.kr/project/emoji/${String(item.id).padStart(2, '0')}.${item.ext}`}));
-        }));
-        if (token !== this.loadToken) return; // 그 사이 다른 그룹 요청이 시작됨 → 이 결과는 버림
+        let responses;
+        try {
+            responses = await Promise.all(ids.map(async id => {
+                const response = await this.fetchWithVersion(this.apiBase+'group/'+id);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const items = await response.json();
+                if (!Array.isArray(items) || items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('올바르지 않은 이모지 목록 응답');
+                return items.map(item => ({...item, name:String(item.word || item.name || ''), groupId:id, groupName:groupMap.get(id)?.name || `그룹 ${id}`, url:item.url || `https://snow.modaweb.kr/project/emoji/${String(item.id).padStart(2, '0')}.${item.ext}`}));
+            }));
+        } catch (error) {
+            if (!isCurrent()) return false;
+            throw error;
+        }
+        if (!isCurrent()) return false; // 이전 그룹/이전 실행의 결과는 버린다.
         for (const items of responses) if (items.length) this.groupThumbs[items[0].groupId] = items[0].url;
         this.saveGroupThumbs();
         // 빈 배열로 온 그룹은 서버 오류일 수 있으니 knownItems 정리 대상에서 제외 (즐겨찾기 오삭제 방지)
         this.applyItems(responses.flat(), ids.filter((id, index) => responses[index].length > 0));
+        return true;
+    }
+
+    // UI 이벤트에서 시작한 요청의 실패도 처리해서 처리되지 않은 Promise를 남기지 않는다.
+    async refreshSelectedGroup(search) {
+        const sessionId = this.sessionId;
+        const request = this.loadGroupItems();
+        const token = this.loadToken;
+        try {
+            if (await request && this.isCurrentSession(sessionId)) this.render(search.value);
+        } catch (error) {
+            if (!this.isCurrentSession(sessionId) || token !== this.loadToken) return;
+            console.warn('[YuikoStickers] 그룹 이모지 로딩 실패:', error);
+            this.setStatusError('그룹을 불러오지 못했습니다. 클릭하면 다시 시도합니다.');
+        }
     }
 
     /**
      * 대표 이미지가 아직 없는 그룹만 서버에서 첫 번째 이모지를 받아옴 (꺼진 그룹도 설정창에 보여주기 위해)
      */
     async loadGroupThumbsFromServer() {
+        const sessionId = this.sessionId;
         const missing = this.groups.filter(group => !this.groupThumbs[group.id]);
         if (!missing.length) return;
         await Promise.all(missing.map(async group => {
@@ -431,14 +502,21 @@ module.exports = class YuikoStickers {
                 const response = await this.fetchWithVersion(this.apiBase+'group/'+group.id);
                 if (!response.ok) return;
                 const items = await response.json();
+                if (!this.isCurrentSession(sessionId)) return;
                 const first = Array.isArray(items) ? items[0] : null;
                 if (first) this.groupThumbs[group.id] = first.url || `https://snow.modaweb.kr/project/emoji/${String(first.id).padStart(2, '0')}.${first.ext}`;
             } catch (error) { console.warn('[YuikoStickers] 그룹 대표 이미지 로딩 실패:', group.id, error.message); }
         }));
+        if (!this.isCurrentSession(sessionId)) return;
         this.saveGroupThumbs();
         if (this.panel) this.renderGroupControls();
     }
-    loadGroupThumbs() { const saved = BdApi.Data.load(this.pluginName, 'groupThumbs'); this.groupThumbs = saved && typeof saved === 'object' ? saved : {}; }
+    loadGroupThumbs() {
+        const saved = BdApi.Data.load(this.pluginName, 'groupThumbs');
+        this.groupThumbs = saved && typeof saved === 'object' && !Array.isArray(saved)
+            ? Object.fromEntries(Object.entries(saved).filter(([,url]) => typeof url === 'string'))
+            : {};
+    }
     saveGroupThumbs() { BdApi.Data.save(this.pluginName, 'groupThumbs', this.groupThumbs); }
     createGroupThumb(group, className) { const url = this.groupThumbs[group.id]; if (!url) return null; const image = document.createElement('img'); image.className = className; image.src = url; image.alt = group.name; image.loading = 'lazy'; return image; }
 
@@ -459,17 +537,24 @@ module.exports = class YuikoStickers {
     }
 
     async checkForUpdates(force = false) {
+        const sessionId = this.sessionId;
         const now = Date.now();
         if (!force && now - this.lastCheckAt < this.checkInterval) return;
         this.lastCheckAt = now;
         try {
             const response = await this.fetchWithVersion(this.apiBase+'latest');
+            if (!this.isCurrentSession(sessionId)) return;
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const data = await response.json();
+            if (!this.isCurrentSession(sessionId)) return;
             if (data.datetime !== this.lastDatetime || !this.items.length) {
-                if (await this.loadGroups(true)) { this.lastDatetime = data.datetime; this.saveCache(); }
+                if (await this.loadGroups(true) && this.isCurrentSession(sessionId)) { this.lastDatetime = data.datetime; this.saveCache(); }
             }
-        } catch (error) { console.warn('[YuikoStickers] 갱신 확인 실패:', error.message); if (!this.items.length) this.setStatusError('서버에 연결하지 못했습니다. 클릭하면 다시 시도합니다.'); }
+        } catch (error) {
+            if (!this.isCurrentSession(sessionId)) return;
+            console.warn('[YuikoStickers] 갱신 확인 실패:', error.message);
+            if (!this.items.length) this.setStatusError('서버에 연결하지 못했습니다. 클릭하면 다시 시도합니다.');
+        }
     }
     setStatusError(message) { if (!this.status) return; this.status.textContent = message; this.status.classList.add('is-error'); }
     clearStatusError() { this.status?.classList.remove('is-error'); }
@@ -518,8 +603,8 @@ module.exports = class YuikoStickers {
         this.renderGroupControls(); this.createPreview(); this.createGroupPreview(); this.bindGroupPreview(managePanel);
         manage.addEventListener('click', event => { event.stopPropagation(); managePanel.classList.toggle('is-open'); this.hideGroupPreview(); this.renderGroupControls(); });
         search.addEventListener('input', () => this.render(search.value));
-        groupbar.addEventListener('click', event => { if (this.suppressNextClick) return; const button = event.target.closest('.yuiko-group-button'); if (!button) return; this.selectedGroupId = button.dataset.groupId === 'all' ? null : Number(button.dataset.groupId); this.saveGroupSettings(); this.renderGroupControls(); this.loadGroupItems().then(() => this.render(search.value)); });
-        managePanel.addEventListener('change', event => { if (!event.target.matches('input[data-group-id]')) return; const id = Number(event.target.dataset.groupId); if (event.target.checked) { if (!this.enabledGroupIds.includes(id)) this.enabledGroupIds.push(id); } else { this.enabledGroupIds = this.enabledGroupIds.filter(value => value !== id); if (this.selectedGroupId === id) this.selectedGroupId = null; } this.saveGroupSettings(); this.renderGroupControls(); this.loadGroupItems().then(() => this.render(search.value)); });
+        groupbar.addEventListener('click', event => { if (this.suppressNextClick) return; const button = event.target.closest('.yuiko-group-button'); if (!button) return; this.selectedGroupId = button.dataset.groupId === 'all' ? null : Number(button.dataset.groupId); this.saveGroupSettings(); this.renderGroupControls(); this.refreshSelectedGroup(search); });
+        managePanel.addEventListener('change', event => { if (!event.target.matches('input[data-group-id]')) return; const id = Number(event.target.dataset.groupId); if (event.target.checked) { if (!this.enabledGroupIds.includes(id)) this.enabledGroupIds.push(id); } else { this.enabledGroupIds = this.enabledGroupIds.filter(value => value !== id); if (this.selectedGroupId === id) this.selectedGroupId = null; } this.saveGroupSettings(); this.renderGroupControls(); this.refreshSelectedGroup(search); });
         managePanel.addEventListener('click', event => { const move = event.target.closest('.yuiko-move'); if (!move) return; this.moveGroup(Number(move.dataset.groupId), Number(move.dataset.dir)); this.renderGroupControls(); this.render(search.value); });
         const afterGroupMove = (id, targetId, before) => { this.moveGroupTo(id, targetId, before); this.renderGroupControls(); this.render(search.value); };
         this.bindDragReorder(managePanel, '.yuiko-manage-row', {axis:'y', getId:element => Number(element.dataset.groupId), onDrop:afterGroupMove});
@@ -559,18 +644,21 @@ module.exports = class YuikoStickers {
         const group = this.groups.find(group => group.id === id);
         if (!group || !this.groupPreview) return;
         this.groupPreviewId = id;
-        const [title, grid] = this.groupPreview.children;
+        const sessionId = this.sessionId;
+        const popup = this.groupPreview;
+        const [title, grid] = popup.children;
         title.replaceChildren(); const thumb = this.createGroupThumb(group, ''); if (thumb) title.appendChild(thumb); title.append(`${group.name} (${group.count})`);
         grid.replaceChildren(); const loading = document.createElement('div'); loading.className = 'yuiko-group-preview-empty'; loading.textContent = '불러오는 중...'; grid.appendChild(loading);
         this.groupPreview.classList.add('is-visible'); this.positionGroupPreview(row);
         const items = await this.getGroupPreviewItems(id);
-        if (this.groupPreviewId !== id) return;   // 그 사이 다른 행으로 이동함
+        if (!this.isCurrentSession(sessionId) || this.groupPreview !== popup || this.groupPreviewId !== id || !row.isConnected) return;
         grid.replaceChildren();
         if (!items.length) { const empty = document.createElement('div'); empty.className = 'yuiko-group-preview-empty'; empty.textContent = '이모지를 불러오지 못했습니다.'; grid.appendChild(empty); }
         for (const item of items) { const image = document.createElement('img'); image.src = item.url; image.alt = item.name; grid.appendChild(image); }
         this.positionGroupPreview(row);
     }
     positionGroupPreview(row) {
+        if (!this.groupPreview || !this.panel || !row.isConnected) return;
         const popup = this.groupPreview, panelRect = this.panel.getBoundingClientRect(), rowRect = row.getBoundingClientRect(), margin = 8;
         const width = popup.offsetWidth || 264, height = popup.offsetHeight || 120;
         // 패널 오른쪽에 자리가 있으면 오른쪽, 없으면 왼쪽
@@ -583,6 +671,7 @@ module.exports = class YuikoStickers {
      * 미리보기용 이모지: 이미 받아둔 것(knownItems)이 있으면 그걸, 없으면 그 그룹만 한 번 받아와서 세션 캐시
      */
     async getGroupPreviewItems(id) {
+        const sessionId = this.sessionId;
         const known = [...this.knownItems.values()].filter(item => item.groupId === id);
         if (known.length) return known.slice(0, this.groupPreviewCount);
         if (this.groupPreviewCache.has(id)) return this.groupPreviewCache.get(id);
@@ -590,6 +679,7 @@ module.exports = class YuikoStickers {
             const response = await this.fetchWithVersion(this.apiBase+'group/'+id);
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const raw = await response.json();
+            if (!this.isCurrentSession(sessionId)) return [];
             const items = (Array.isArray(raw) ? raw : []).slice(0, this.groupPreviewCount).map(item => ({url:item.url || `https://snow.modaweb.kr/project/emoji/${String(item.id).padStart(2, '0')}.${item.ext}`, name:String(item.word || item.name || '')}));
             this.groupPreviewCache.set(id, items);
             return items;
@@ -681,7 +771,17 @@ module.exports = class YuikoStickers {
         list.scrollLeft = scrollToEnd ? list.scrollWidth : previousScroll;
     }
 
-    showPreview(item, event) { this.previewImage.src = item.url; this.preview.classList.add('is-visible'); let left = event.clientX + 18, top = event.clientY + 18; const width = this.preview.offsetWidth || 200, height = this.preview.offsetHeight || 220; if (left + width > innerWidth - 10) left = event.clientX - width - 18; if (top + height > innerHeight - 10) top = event.clientY - height - 18; this.preview.style.left = `${Math.max(10,left)}px`; this.preview.style.top = `${Math.max(10,top)}px`; }
+    showPreview(item, event) {
+        if (!this.previewImage || !this.preview) return;
+        // 같은 이미지 위의 mousemove마다 src를 다시 쓰지 않는다 (GIF 재시작/불필요한 DOM 변경 방지).
+        if (this.previewImage.getAttribute('src') !== item.url) this.previewImage.src = item.url;
+        this.preview.classList.add('is-visible');
+        let left = event.clientX + 18, top = event.clientY + 18;
+        const width = this.preview.offsetWidth || 200, height = this.preview.offsetHeight || 220;
+        if (left + width > innerWidth - 10) left = event.clientX - width - 18;
+        if (top + height > innerHeight - 10) top = event.clientY - height - 18;
+        this.preview.style.left = `${Math.max(10,left)}px`; this.preview.style.top = `${Math.max(10,top)}px`;
+    }
     hidePreview() { this.preview?.classList.remove('is-visible'); }
 
     togglePanel(button) {
@@ -712,13 +812,15 @@ module.exports = class YuikoStickers {
         if (!this.grid) return;
         this.cancelLongPress();
         this.hidePreview(); this.grid.replaceChildren();
+        const fragment = document.createDocumentFragment();
         const query = filter.trim().toLowerCase();
         const items = this.items.filter(item => !query || item.name.toLowerCase().includes(query));
         // 즐겨찾기는 현재 그룹과 관계없이 전부 표시
         const favoriteItems = [...this.favorites].map(url => this.knownItems.get(url)).filter(item => item && (!query || item.name.toLowerCase().includes(query)));
-        if (favoriteItems.length) { this.grid.appendChild(this.createSection(`즐겨찾기 ${favoriteItems.length}`)); favoriteItems.forEach(item => this.grid.appendChild(this.createItem(item, 'fav'))); }
-        this.grid.appendChild(this.createSection(`${this.selectedGroupId === null ? '선택 그룹' : this.groups.find(group => group.id === this.selectedGroupId)?.name || '그룹'} · 전체 ${items.length}`, true));
-        this.sortItems(items).forEach(item => this.grid.appendChild(this.createItem(item)));
+        if (favoriteItems.length) { fragment.appendChild(this.createSection(`즐겨찾기 ${favoriteItems.length}`)); favoriteItems.forEach(item => fragment.appendChild(this.createItem(item, 'fav'))); }
+        fragment.appendChild(this.createSection(`${this.selectedGroupId === null ? '선택 그룹' : this.groups.find(group => group.id === this.selectedGroupId)?.name || '그룹'} · 전체 ${items.length}`, true));
+        this.sortItems(items).forEach(item => fragment.appendChild(this.createItem(item)));
+        this.grid.appendChild(fragment);
         this.clearStatusError();
         this.status.textContent = this.selectedGroupId === null && !this.enabledGroupIds?.length ? '표시할 그룹이 없습니다. ⚙에서 그룹을 선택하세요.' : '';
         this.updateQueueStatus();
@@ -751,24 +853,57 @@ module.exports = class YuikoStickers {
         if (this.savedSelection && composer.contains(this.savedSelection.commonAncestorContainer)) { selection.removeAllRanges(); selection.addRange(this.savedSelection.cloneRange()); } else { const range = document.createRange(); range.selectNodeContents(composer); range.collapse(false); selection.removeAllRanges(); selection.addRange(range); }
         const allowed = composer.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, cancelable:true, inputType:'insertText', data:command}));
         if (allowed && !document.execCommand('insertText', false, command)) return BdApi.UI.showToast('Discord가 입력을 처리하지 못했습니다.', {type:'error'});
-        selectedItems.forEach(selected => this.addRecent(selected));
+        this.addRecentItems(selectedItems);
         if (!allowed || this.autoSend) this.sendMessage(composer);
     }
-    sendMessage(composer) { if (!this.autoSend) return; setTimeout(() => { if (!composer?.isConnected) return; composer.focus(); composer.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true})); composer.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true})); this.savedSelection = null; }, 0); }
+    sendMessage(composer) {
+        if (!this.autoSend || !this.running) return;
+        const sessionId = this.sessionId;
+        const timer = setTimeout(() => {
+            this.pendingSendTimers.delete(timer);
+            if (!this.isCurrentSession(sessionId) || !composer?.isConnected) return;
+            composer.focus();
+            composer.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true}));
+            composer.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true}));
+            this.savedSelection = null;
+        }, 0);
+        this.pendingSendTimers.add(timer);
+    }
 
-    loadFavorites() { this.favorites = new Set(BdApi.Data.load(this.pluginName, 'favorites') || []); }
+    loadFavorites() { const saved = BdApi.Data.load(this.pluginName, 'favorites'); this.favorites = new Set(Array.isArray(saved) ? saved.filter(url => typeof url === 'string') : []); }
     saveFavorites() { BdApi.Data.save(this.pluginName, 'favorites', [...this.favorites]); }
-    loadRecent() { const saved = BdApi.Data.load(this.pluginName, 'recent'); this.recent = Array.isArray(saved) ? saved.filter(item => typeof item === 'string') : []; }
+    loadRecent() { const saved = BdApi.Data.load(this.pluginName, 'recent'); this.recent = Array.isArray(saved) ? [...new Set(saved.filter(item => typeof item === 'string'))].slice(0, this.maxRecent) : []; }
     saveRecent() { BdApi.Data.save(this.pluginName, 'recent', this.recent); }
-    addRecent(item) { this.recent = [item.url, ...this.recent.filter(url => url !== item.url)].slice(0, this.maxRecent); this.saveRecent(); if (this.sortByRecent) this.rerender(); }
+    addRecent(item) { this.addRecentItems([item]); }
+    addRecentItems(items) {
+        if (!items.length) return;
+        // 기존처럼 마지막에 전송한 항목이 맨 앞. 중복 선택도 같은 최종 순서를 만든다.
+        for (const item of items) this.recent = [item.url, ...this.recent.filter(url => url !== item.url)].slice(0, this.maxRecent);
+        this.saveRecent();
+        if (this.sortByRecent) this.rerender();
+    }
     loadSortSetting() { this.sortByRecent = BdApi.Data.load(this.pluginName, 'sortByRecent') === true; }
     saveSortSetting() { BdApi.Data.save(this.pluginName, 'sortByRecent', this.sortByRecent); }
     toggleSort() { this.sortByRecent = !this.sortByRecent; this.saveSortSetting(); this.rerender(); }
     sortItems(items) { if (!this.sortByRecent) return items; const rank = new Map(this.recent.map((url,index) => [url,index])); return [...items].sort((a,b) => (rank.get(a.url) ?? 999999)-(rank.get(b.url) ?? 999999)); }
     toggleFavorite(item) { this.favorites.has(item.url) ? this.favorites.delete(item.url) : this.favorites.add(item.url); this.saveFavorites(); this.rerender(); }
     rerender() { this.render(this.panel?.querySelector('.yuiko-search')?.value || ''); }
-    pruneStoredUrls() { this.favorites = new Set([...this.favorites].filter(url => this.knownItems.has(url))); this.recent = this.recent.filter(url => this.knownItems.has(url)); this.saveFavorites(); this.saveRecent(); }
-    loadGroupSettings() { const saved = BdApi.Data.load(this.pluginName, 'enabledGroups'); this.enabledGroupIds = Array.isArray(saved) ? saved.map(Number) : null; const order = BdApi.Data.load(this.pluginName, 'groupOrder'); this.groupOrder = Array.isArray(order) ? order.map(Number) : []; const selected = BdApi.Data.load(this.pluginName, 'selectedGroup'); this.selectedGroupId = selected === null || selected === undefined ? null : Number(selected); }
+    pruneStoredUrls() {
+        const favorites = [...this.favorites].filter(url => this.knownItems.has(url));
+        const recent = this.recent.filter(url => this.knownItems.has(url));
+        if (favorites.length !== this.favorites.size) { this.favorites = new Set(favorites); this.saveFavorites(); }
+        if (recent.length !== this.recent.length) { this.recent = recent; this.saveRecent(); }
+    }
+    loadGroupSettings() {
+        const validId = value => (typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isSafeInteger(Number(value)) && Number(value) >= 0;
+        const ids = values => [...new Set(values.filter(validId).map(Number))];
+        const saved = BdApi.Data.load(this.pluginName, 'enabledGroups');
+        this.enabledGroupIds = Array.isArray(saved) ? ids(saved) : null;
+        const order = BdApi.Data.load(this.pluginName, 'groupOrder');
+        this.groupOrder = Array.isArray(order) ? ids(order) : [];
+        const selected = BdApi.Data.load(this.pluginName, 'selectedGroup');
+        this.selectedGroupId = validId(selected) ? Number(selected) : null;
+    }
     saveGroupSettings() { BdApi.Data.save(this.pluginName, 'enabledGroups', this.enabledGroupIds || []); BdApi.Data.save(this.pluginName, 'selectedGroup', this.selectedGroupId); BdApi.Data.save(this.pluginName, 'groupOrder', this.groupOrder); }
 
     /**
@@ -797,15 +932,25 @@ module.exports = class YuikoStickers {
         const isBefore = (element, event) => { const rect = element.getBoundingClientRect(); return axis === 'x' ? event.clientX < rect.left + rect.width/2 : event.clientY < rect.top + rect.height/2; };
         const clearMarks = () => container.querySelectorAll('.drop-before, .drop-after').forEach(element => element.classList.remove('drop-before', 'drop-after'));
         const targetAt = event => { const hit = document.elementFromPoint(event.clientX, event.clientY)?.closest(selector); return hit && container.contains(hit) ? hit : null; };
+        const reset = () => {
+            if (!state) return;
+            const current = state; state = null;
+            try { container.releasePointerCapture(current.pointerId); } catch {}
+            current.element.classList.remove('is-dragging');
+            clearMarks();
+            if (current.active) this.dragActive = false;
+        };
         container.addEventListener('pointerdown', event => {
             if (event.button !== 0 || event.target.closest('input, button')) return;   // 좌클릭만, 체크박스·▲▼ 버튼은 제외
             const element = event.target.closest(selector);
             if (!element || !container.contains(element)) return;
-            state = {id:getId(element), element, startX:event.clientX, startY:event.clientY, active:false};
+            reset();
+            state = {id:getId(element), element, startX:event.clientX, startY:event.clientY, pointerId:event.pointerId, active:false};
         });
         container.addEventListener('pointermove', event => {
             if (!state) return;
-            if (this.suppressEmojiClick || !state.element.isConnected) { state = null; return; }
+            if (state.pointerId !== undefined && event.pointerId !== undefined && state.pointerId !== event.pointerId) return;
+            if (this.suppressEmojiClick || !state.element.isConnected) { reset(); return; }
             if (!state.active) {
                 if (Math.hypot(event.clientX-state.startX, event.clientY-state.startY) < threshold) return;
                 state.active = true; this.dragActive = true;
@@ -820,18 +965,36 @@ module.exports = class YuikoStickers {
         });
         const finish = event => {
             if (!state) return;
+            if (state.pointerId !== undefined && event.pointerId !== undefined && state.pointerId !== event.pointerId) return;
             const current = state; state = null;
             try { container.releasePointerCapture(event.pointerId); } catch {}
             if (!current.active) return;
             this.dragActive = false;
             current.element.classList.remove('is-dragging'); clearMarks();
             const target = event.type === 'pointerup' ? targetAt(event) : null;
-            if (target && getId(target) !== current.id) onDrop(current.id, getId(target), isBefore(target, event));
+            if (current.element.isConnected && target && getId(target) !== current.id) onDrop(current.id, getId(target), isBefore(target, event));
             // 드래그를 끝낸 pointerup 뒤에 따라오는 click은 무시 (이모지 전송/그룹 선택 방지)
-            this.suppressNextClick = true; setTimeout(() => { this.suppressNextClick = false; }, 0);
+            this.suppressNextClick = true;
+            clearTimeout(this.dragResetTimer);
+            this.dragResetTimer = setTimeout(() => { this.dragResetTimer = null; this.suppressNextClick = false; }, 0);
         };
+        // 캡처 전 영역 밖에서 버튼을 놓거나 창이 포커스를 잃어도 상태를 해제한다.
+        // 컨테이너 리스너도 유지: Discord가 상위에서 전파를 막아도 드롭은 완료된다.
         container.addEventListener('pointerup', finish);
         container.addEventListener('pointercancel', finish);
+        document.addEventListener('pointerup', finish);
+        document.addEventListener('pointercancel', finish);
+        window.addEventListener('blur', reset);
+        container.addEventListener('lostpointercapture', reset);
+        this.dragCleanups.add(() => {
+            reset();
+            container.removeEventListener('pointerup', finish);
+            container.removeEventListener('pointercancel', finish);
+            document.removeEventListener('pointerup', finish);
+            document.removeEventListener('pointercancel', finish);
+            window.removeEventListener('blur', reset);
+            container.removeEventListener('lostpointercapture', reset);
+        });
     }
     /**
      * 즐겨찾기 url을 targetUrl 앞/뒤로 이동 (Set의 삽입 순서를 다시 만듦)
