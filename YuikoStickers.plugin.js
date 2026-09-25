@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.13
+ * @version 2.17.14
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -375,6 +375,7 @@ module.exports = class YuikoStickers {
         if (!composer.hasAttribute('data-slate-editor') && !/message|메시지/i.test(composer.getAttribute('aria-label') || composer.getAttribute('data-placeholder') || '')) return null;
         const before = caret.cloneRange(); before.selectNodeContents(composer); before.setEnd(caret.endContainer, caret.endOffset);
         const text = before.toString();
+        if (!text.startsWith(this.commandPrefix)) return null;
         const match = /(?:^|\s)\.[^\s]*$/u.exec(text);
         // Adjacent sticker commands also allow completing the last dot token.
         const start = text.lastIndexOf(this.commandPrefix);
