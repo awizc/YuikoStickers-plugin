@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.9
+ * @version 2.17.10
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -334,7 +334,7 @@ module.exports = class YuikoStickers {
             if (!['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(event.key) || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
             event.preventDefault(); event.stopImmediatePropagation();
             if (event.key === 'Escape') { this.autocompleteDismissed = this.autocompleteContext?.key; close(); return; }
-            if (event.key === 'Enter' || event.key === 'Tab') return this.acceptAutocomplete();
+            if (event.key === 'Enter' || event.key === 'Tab') return this.acceptAutocomplete(event.key === 'Tab');
             const count = this.autocompleteItems.length;
             this.autocompleteIndex = (this.autocompleteIndex + (event.key === 'ArrowDown' ? 1 : -1) + count) % count;
             this.highlightAutocomplete();
@@ -354,10 +354,10 @@ module.exports = class YuikoStickers {
         if (!composer.hasAttribute('data-slate-editor') && !/message|메시지/i.test(composer.getAttribute('aria-label') || composer.getAttribute('data-placeholder') || '')) return null;
         const before = caret.cloneRange(); before.selectNodeContents(composer); before.setEnd(caret.endContainer, caret.endOffset);
         const text = before.toString();
-        const match = /(?:^|[\s.])\.([^\s.]*)$/u.exec(text);
+        const match = /(?:^|\s)\.[^\s]*$/u.exec(text);
         // Adjacent sticker commands also allow completing the last dot token.
         const start = text.lastIndexOf(this.commandPrefix);
-        if (start < 0 || (!match && (start === 0 || !text.startsWith(this.commandPrefix)))) return null;
+        if (start < 0 || !match) return null;
         const query = text.slice(start + 1);
         if (/\s/.test(query)) return null;
         const range = caret.cloneRange();
@@ -426,7 +426,7 @@ module.exports = class YuikoStickers {
         panel.style.width = `${Math.max(0, Math.min(Math.max(240, rect.width), innerWidth - 16))}px`;
         panel.style.bottom = `${Math.max(8, innerHeight - rect.top + 8)}px`;
         panel.style.maxHeight = `${Math.max(0, Math.min(360, rect.top - 16))}px`;
-        const heading = document.createElement('div'); heading.textContent = `Yuiko 호출어 · ${items.length}개${items.length > 100 ? ' (상위 100개)' : ''} · ↑↓ 이동 · Tab/Enter 선택`; heading.style.cssText = 'padding:6px 8px;font-size:12px;color:var(--text-muted,#aaa)'; panel.append(heading);
+        const heading = document.createElement('div'); heading.textContent = `Yuiko 호출어 · ${items.length}개${items.length > 100 ? ' (상위 100개)' : ''} · ↑↓ 이동 · Tab 연속 선택 · Enter/클릭 전송`; heading.style.cssText = 'padding:6px 8px;font-size:12px;color:var(--text-muted,#aaa)'; panel.append(heading);
         this.autocompleteItems.forEach((item, index) => {
             const row = document.createElement('div'); row.setAttribute('role','option');
             row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:8px;border-radius:4px;cursor:pointer;';
@@ -453,18 +453,24 @@ module.exports = class YuikoStickers {
         });
     }
 
-    acceptAutocomplete() {
+    acceptAutocomplete(keepSearch = false) {
         if (this.autocompleteComposing) return;
         const context = this.getAutocompleteContext();
         const item = this.autocompleteItems?.[this.autocompleteIndex];
         if (!context || context.composer !== this.autocompleteContext?.composer || context.key !== this.autocompleteContext?.key || !item) return this.closeAutocomplete();
-        const command = `.${item.name.split(',')[0].trim()}`;
-        this.closeAutocomplete();
+        const command = `.${item.name.split(',')[0].trim()}${keepSearch ? `.${context.query}` : ''}`;
+        if (!keepSearch) this.closeAutocomplete();
         const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(context.range);
         const allowed = context.composer.dispatchEvent(new InputEvent('beforeinput', {bubbles:true,cancelable:true,inputType:'insertText',data:command}));
-        if (allowed && !document.execCommand('insertText',false,command)) BdApi.UI.showToast('Discord가 입력을 처리하지 못했습니다.', {type:'error'});
+        if (allowed && !document.execCommand('insertText',false,command)) return BdApi.UI.showToast('Discord가 입력을 처리하지 못했습니다.', {type:'error'});
+        if (keepSearch) {
+            this.autocompleteDismissed = null;
+            this.refreshAutocomplete();
+            return;
+        }
         this.autocompleteDismissed = this.getAutocompleteContext()?.key;
         this.closeAutocomplete();
+        this.sendMessage(context.composer);
     }
 
     getVersion() {
