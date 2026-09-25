@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.12
+ * @version 2.17.13
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -428,6 +428,12 @@ module.exports = class YuikoStickers {
             if (context?.composer !== edit.composer || context.key !== edit.expectedKey) return;
             clearTimeout(this.autocompleteEditTimer); this.autocompleteEditTimer = null;
             this.autocompleteEdit = null;
+            if (edit.send) {
+                this.autocompleteDismissed = context.key;
+                this.closeAutocomplete();
+                this.sendMessage(edit.composer, context.key);
+                return;
+            }
         }
         if (!context || context.key === this.autocompleteDismissed) return this.closeAutocomplete();
         const query = context.query.toLowerCase();
@@ -489,29 +495,25 @@ module.exports = class YuikoStickers {
         const item = this.autocompleteItems?.[this.autocompleteIndex];
         if (!context || context.composer !== this.autocompleteContext?.composer || context.key !== this.autocompleteContext?.key || !item) return this.closeAutocomplete();
         const command = `.${item.name.split(',')[0].trim()}${keepSearch ? `.${context.query}` : ''}`;
-        if (!keepSearch) this.closeAutocomplete();
-        else {
-            this.autocompleteEdit = {composer:context.composer, expectedKey:context.key.slice(0, -(context.query.length + 1)) + command};
-            this.autocompleteEditTimer = setTimeout(() => {
-                this.autocompleteEdit = null; this.autocompleteEditTimer = null;
-                this.refreshAutocomplete();
-            }, 500);
-        }
-        const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(context.range);
-        // insertText emits the native input events itself. Dispatching beforeinput
-        // manually as well lets Slate apply the same replacement twice.
-        if (!document.execCommand('insertText',false,command)) {
+        this.autocompleteEdit = {composer:context.composer, expectedKey:context.key.slice(0, -(context.query.length + 1)) + command, send:!keepSearch};
+        this.autocompleteEditTimer = setTimeout(() => {
             this.closeAutocomplete();
-            return BdApi.UI.showToast('Discord가 입력을 처리하지 못했습니다.', {type:'error'});
-        }
-        if (keepSearch) {
-            this.autocompleteDismissed = null;
-            this.refreshAutocomplete();
-            return;
-        }
-        this.autocompleteDismissed = this.getAutocompleteContext()?.key;
-        this.closeAutocomplete();
-        this.sendMessage(context.composer);
+            BdApi.UI.showToast('호출어 입력을 확인하지 못해 전송을 취소했습니다.', {type:'error'});
+        }, 500);
+        const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(context.range);
+        // Let Slate update its own document. Do not additionally mutate the DOM
+        // with execCommand: React can revert that DOM-only edit before sending.
+        const input = new InputEvent('beforeinput', {bubbles:true,cancelable:true,inputType:'insertText',data:command});
+        // Slate uses target ranges to synchronize its model selection. A synthetic
+        // InputEvent otherwise returns [], leaving its old caret in use.
+        const targetRange = new window.StaticRange({
+            startContainer:context.range.startContainer, startOffset:context.range.startOffset,
+            endContainer:context.range.endContainer, endOffset:context.range.endOffset
+        });
+        Object.defineProperty(input, 'getTargetRanges', {value:() => [targetRange]});
+        context.composer.dispatchEvent(input);
+        this.autocompleteDismissed = null;
+        this.refreshAutocomplete();
     }
 
     getVersion() {
@@ -1098,12 +1100,19 @@ module.exports = class YuikoStickers {
         this.addRecentItems(selectedItems);
         if (!allowed || this.autoSend) this.sendMessage(composer);
     }
-    sendMessage(composer) {
+    sendMessage(composer, expectedKey = null) {
         if (!this.autoSend || !this.running) return;
         const sessionId = this.sessionId;
         const timer = setTimeout(() => {
             this.pendingSendTimers.delete(timer);
             if (!this.isCurrentSession(sessionId) || !composer?.isConnected) return;
+            if (expectedKey !== null) {
+                const context = this.getAutocompleteContext();
+                if (context?.composer !== composer || context.key !== expectedKey) {
+                    BdApi.UI.showToast('입력 내용이 변경되어 전송을 취소했습니다.', {type:'error'});
+                    return;
+                }
+            }
             composer.focus();
             const down = new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true});
             const up = new KeyboardEvent('keyup', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true});
