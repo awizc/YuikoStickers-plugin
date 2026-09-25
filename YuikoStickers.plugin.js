@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.11
+ * @version 2.17.12
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -330,7 +330,7 @@ module.exports = class YuikoStickers {
         const close = () => this.closeAutocomplete();
         const compositionStart = () => { this.autocompleteComposing = true; };
         const compositionEnd = () => { this.autocompleteComposing = false; input(); };
-        const scroll = event => { if (!this.autocomplete?.contains(event.target)) close(); };
+        const scroll = event => { if (!this.autocompleteEdit && !this.autocomplete?.contains(event.target)) close(); };
         const outside = event => { if (!this.autocomplete?.contains(event.target)) close(); };
         const keyup = event => {
             if (event.key === 'Enter' && !this.syntheticSendEvents.has(event)) this.autocompleteEnterHeld = null;
@@ -393,6 +393,8 @@ module.exports = class YuikoStickers {
     }
 
     closeAutocomplete() {
+        clearTimeout(this.autocompleteEditTimer); this.autocompleteEditTimer = null;
+        this.autocompleteEdit = null;
         this.autocomplete?.remove(); this.autocomplete = null;
         this.autocompleteContext = null; this.autocompleteItems = [];
     }
@@ -420,6 +422,13 @@ module.exports = class YuikoStickers {
     refreshAutocomplete() {
         if (!this.running) return;
         const context = this.getAutocompleteContext();
+        if (this.autocompleteEdit) {
+            const edit = this.autocompleteEdit;
+            if (!edit.composer.isConnected || document.activeElement !== edit.composer) return this.closeAutocomplete();
+            if (context?.composer !== edit.composer || context.key !== edit.expectedKey) return;
+            clearTimeout(this.autocompleteEditTimer); this.autocompleteEditTimer = null;
+            this.autocompleteEdit = null;
+        }
         if (!context || context.key === this.autocompleteDismissed) return this.closeAutocomplete();
         const query = context.query.toLowerCase();
         const items = [...this.knownItems.values()].filter(item => this.enabledGroupIds?.includes(item.groupId) && this.matchesAutocomplete(item.name, query));
@@ -475,15 +484,26 @@ module.exports = class YuikoStickers {
     }
 
     acceptAutocomplete(keepSearch = false) {
-        if (this.autocompleteComposing) return;
+        if (this.autocompleteComposing || this.autocompleteEdit) return;
         const context = this.getAutocompleteContext();
         const item = this.autocompleteItems?.[this.autocompleteIndex];
         if (!context || context.composer !== this.autocompleteContext?.composer || context.key !== this.autocompleteContext?.key || !item) return this.closeAutocomplete();
         const command = `.${item.name.split(',')[0].trim()}${keepSearch ? `.${context.query}` : ''}`;
         if (!keepSearch) this.closeAutocomplete();
+        else {
+            this.autocompleteEdit = {composer:context.composer, expectedKey:context.key.slice(0, -(context.query.length + 1)) + command};
+            this.autocompleteEditTimer = setTimeout(() => {
+                this.autocompleteEdit = null; this.autocompleteEditTimer = null;
+                this.refreshAutocomplete();
+            }, 500);
+        }
         const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(context.range);
-        const allowed = context.composer.dispatchEvent(new InputEvent('beforeinput', {bubbles:true,cancelable:true,inputType:'insertText',data:command}));
-        if (allowed && !document.execCommand('insertText',false,command)) return BdApi.UI.showToast('Discord가 입력을 처리하지 못했습니다.', {type:'error'});
+        // insertText emits the native input events itself. Dispatching beforeinput
+        // manually as well lets Slate apply the same replacement twice.
+        if (!document.execCommand('insertText',false,command)) {
+            this.closeAutocomplete();
+            return BdApi.UI.showToast('Discord가 입력을 처리하지 못했습니다.', {type:'error'});
+        }
         if (keepSearch) {
             this.autocompleteDismissed = null;
             this.refreshAutocomplete();
