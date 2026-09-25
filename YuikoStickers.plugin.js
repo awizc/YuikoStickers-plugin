@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.10
+ * @version 2.17.11
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -323,25 +323,46 @@ module.exports = class YuikoStickers {
         this.unbindAutocomplete?.();
         const refresh = () => this.refreshAutocomplete();
         this.autocompleteComposing = false;
+        this.autocompleteEnterHeld = null;
+        this.autocompleteTabHeld = null;
+        this.syntheticSendEvents = new WeakSet();
         const input = () => { this.autocompleteDismissed = null; refresh(); };
         const close = () => this.closeAutocomplete();
         const compositionStart = () => { this.autocompleteComposing = true; };
         const compositionEnd = () => { this.autocompleteComposing = false; input(); };
         const scroll = event => { if (!this.autocomplete?.contains(event.target)) close(); };
         const outside = event => { if (!this.autocomplete?.contains(event.target)) close(); };
+        const keyup = event => {
+            if (event.key === 'Enter' && !this.syntheticSendEvents.has(event)) this.autocompleteEnterHeld = null;
+            if (event.key === 'Tab') this.autocompleteTabHeld = null;
+        };
+        const blur = () => { this.autocompleteEnterHeld = this.autocompleteTabHeld = null; close(); };
         const keydown = event => {
+            // Our send event must reach Discord, even if Slate reopened the suggestions.
+            if (this.syntheticSendEvents.has(event)) { close(); return; }
+            if (event.key === 'Enter' && this.autocompleteEnterHeld?.contains(event.target)) {
+                event.preventDefault(); event.stopImmediatePropagation(); return;
+            }
+            if (event.key === 'Tab' && this.autocompleteTabHeld?.contains(event.target)) {
+                event.preventDefault(); event.stopImmediatePropagation(); return;
+            }
             if (!this.autocomplete || this.autocompleteComposing || event.isComposing || event.keyCode === 229) return;
             if (!['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(event.key) || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
             event.preventDefault(); event.stopImmediatePropagation();
             if (event.key === 'Escape') { this.autocompleteDismissed = this.autocompleteContext?.key; close(); return; }
-            if (event.key === 'Enter' || event.key === 'Tab') return this.acceptAutocomplete(event.key === 'Tab');
+            if (event.key === 'Enter' || event.key === 'Tab') {
+                if (event.repeat) return;
+                if (event.key === 'Enter') this.autocompleteEnterHeld = this.autocompleteContext?.composer;
+                if (event.key === 'Tab') this.autocompleteTabHeld = this.autocompleteContext?.composer;
+                return this.acceptAutocomplete(event.key === 'Tab');
+            }
             const count = this.autocompleteItems.length;
             this.autocompleteIndex = (this.autocompleteIndex + (event.key === 'ArrowDown' ? 1 : -1) + count) % count;
             this.highlightAutocomplete();
         };
-        const listeners = [[document,'input',input], [document,'selectionchange',refresh], [document,'compositionstart',compositionStart], [document,'compositionupdate',input], [document,'compositionend',compositionEnd], [document,'keydown',keydown], [document,'mousedown',outside], [document,'scroll',scroll], [window,'resize',close], [window,'blur',close]];
+        const listeners = [[document,'input',input], [document,'selectionchange',refresh], [document,'compositionstart',compositionStart], [document,'compositionupdate',input], [document,'compositionend',compositionEnd], [document,'keydown',keydown], [document,'keyup',keyup], [document,'mousedown',outside], [document,'scroll',scroll], [window,'resize',close], [window,'blur',blur]];
         for (const [target, type, handler] of listeners) target.addEventListener(type, handler, true);
-        this.unbindAutocomplete = () => { for (const [target, type, handler] of listeners) target.removeEventListener(type, handler, true); };
+        this.unbindAutocomplete = () => { this.autocompleteEnterHeld = this.autocompleteTabHeld = null; for (const [target, type, handler] of listeners) target.removeEventListener(type, handler, true); };
     }
 
     getAutocompleteContext() {
@@ -1064,8 +1085,12 @@ module.exports = class YuikoStickers {
             this.pendingSendTimers.delete(timer);
             if (!this.isCurrentSession(sessionId) || !composer?.isConnected) return;
             composer.focus();
-            composer.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true}));
-            composer.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true}));
+            const down = new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true});
+            const up = new KeyboardEvent('keyup', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true});
+            this.syntheticSendEvents ??= new WeakSet();
+            this.syntheticSendEvents.add(down); this.syntheticSendEvents.add(up);
+            composer.dispatchEvent(down);
+            composer.dispatchEvent(up);
             this.savedSelection = null;
         }, 0);
         this.pendingSendTimers.add(timer);
