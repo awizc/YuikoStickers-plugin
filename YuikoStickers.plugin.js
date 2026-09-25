@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.17.8
+ * @version 2.17.9
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -100,9 +100,13 @@ module.exports = class YuikoStickers {
         this.loadCache();
         this.loadGroups(true);
         this.observeDiscord();
+        this.bindAutocomplete();
     }
 
     stop() {
+        this.unbindAutocomplete?.();
+        this.unbindAutocomplete = null;
+        this.closeAutocomplete();
         this.running = false;
         this.sessionId++;
         this.loadToken++;
@@ -140,6 +144,11 @@ module.exports = class YuikoStickers {
 
     addStyles() {
         BdApi.DOM.addStyle(this.pluginName, `
+            .yuiko-autocomplete { scrollbar-width:thin; scrollbar-color:var(--background-tertiary,#111214) var(--background-secondary,#232428); scrollbar-gutter:stable; }
+            .yuiko-autocomplete::-webkit-scrollbar { width:8px; }
+            .yuiko-autocomplete::-webkit-scrollbar-track { background:var(--background-secondary,#232428); border-radius:8px; }
+            .yuiko-autocomplete::-webkit-scrollbar-thumb { background:var(--background-tertiary,#111214); border:2px solid var(--background-secondary,#232428); border-radius:8px; }
+            .yuiko-autocomplete::-webkit-scrollbar-thumb:hover { background:var(--text-muted,#80848e); }
             /* 채팅 이미지 위의 Discord GIF 배지만 숨김 (움직이는 이미지는 유지) */
             [id^="chat-messages-"] [class^="gifTag_"],
             [id^="chat-messages-"] [class*=" gifTag_"],
@@ -308,6 +317,154 @@ module.exports = class YuikoStickers {
         if (!selection?.rangeCount) return;
         const range = selection.getRangeAt(0);
         if (this.composer.contains(range.commonAncestorContainer)) this.savedSelection = range.cloneRange();
+    }
+
+    bindAutocomplete() {
+        this.unbindAutocomplete?.();
+        const refresh = () => this.refreshAutocomplete();
+        this.autocompleteComposing = false;
+        const input = () => { this.autocompleteDismissed = null; refresh(); };
+        const close = () => this.closeAutocomplete();
+        const compositionStart = () => { this.autocompleteComposing = true; };
+        const compositionEnd = () => { this.autocompleteComposing = false; input(); };
+        const scroll = event => { if (!this.autocomplete?.contains(event.target)) close(); };
+        const outside = event => { if (!this.autocomplete?.contains(event.target)) close(); };
+        const keydown = event => {
+            if (!this.autocomplete || this.autocompleteComposing || event.isComposing || event.keyCode === 229) return;
+            if (!['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(event.key) || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+            event.preventDefault(); event.stopImmediatePropagation();
+            if (event.key === 'Escape') { this.autocompleteDismissed = this.autocompleteContext?.key; close(); return; }
+            if (event.key === 'Enter' || event.key === 'Tab') return this.acceptAutocomplete();
+            const count = this.autocompleteItems.length;
+            this.autocompleteIndex = (this.autocompleteIndex + (event.key === 'ArrowDown' ? 1 : -1) + count) % count;
+            this.highlightAutocomplete();
+        };
+        const listeners = [[document,'input',input], [document,'selectionchange',refresh], [document,'compositionstart',compositionStart], [document,'compositionupdate',input], [document,'compositionend',compositionEnd], [document,'keydown',keydown], [document,'mousedown',outside], [document,'scroll',scroll], [window,'resize',close], [window,'blur',close]];
+        for (const [target, type, handler] of listeners) target.addEventListener(type, handler, true);
+        this.unbindAutocomplete = () => { for (const [target, type, handler] of listeners) target.removeEventListener(type, handler, true); };
+    }
+
+    getAutocompleteContext() {
+        const selection = window.getSelection();
+        if (!selection?.rangeCount || !selection.isCollapsed) return null;
+        const caret = selection.getRangeAt(0);
+        const element = caret.endContainer.nodeType === 1 ? caret.endContainer : caret.endContainer.parentElement;
+        const composer = element?.closest('[contenteditable="true"]');
+        if (!composer || composer !== document.activeElement || composer.closest('.yuiko-panel, [role="search"], [class*="search"]')) return null;
+        if (!composer.hasAttribute('data-slate-editor') && !/message|메시지/i.test(composer.getAttribute('aria-label') || composer.getAttribute('data-placeholder') || '')) return null;
+        const before = caret.cloneRange(); before.selectNodeContents(composer); before.setEnd(caret.endContainer, caret.endOffset);
+        const text = before.toString();
+        const match = /(?:^|[\s.])\.([^\s.]*)$/u.exec(text);
+        // Adjacent sticker commands also allow completing the last dot token.
+        const start = text.lastIndexOf(this.commandPrefix);
+        if (start < 0 || (!match && (start === 0 || !text.startsWith(this.commandPrefix)))) return null;
+        const query = text.slice(start + 1);
+        if (/\s/.test(query)) return null;
+        const range = caret.cloneRange();
+        const walker = document.createTreeWalker(composer, 4);
+        let offset = 0, node;
+        while ((node = walker.nextNode())) {
+            if (offset + node.textContent.length > start) { range.setStart(node, start - offset); break; }
+            offset += node.textContent.length;
+        }
+        if (!node) return null;
+        return {composer, range, query, key:text};
+    }
+
+    closeAutocomplete() {
+        this.autocomplete?.remove(); this.autocomplete = null;
+        this.autocompleteContext = null; this.autocompleteItems = [];
+    }
+
+    matchesAutocomplete(name, query) {
+        const initials = 'ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ';
+        const needle = [...query.normalize('NFC').toLowerCase()];
+        return name.split(',').some(alias => {
+            const letters = [...alias.trim().normalize('NFC').toLowerCase()];
+            return letters.some((_, start) => needle.every((char, index) => {
+                const candidate = letters[start + index];
+                if (!candidate) return false;
+                if (candidate === char) return true;
+                const code = candidate.charCodeAt(0) - 0xAC00;
+                if (code < 0 || code >= 11172) return false;
+                const initialIndex = initials.indexOf(char);
+                if (initialIndex >= 0) return Math.floor(code / 588) === initialIndex;
+                // The last syllable may still be receiving its final consonant in the IME.
+                const typed = char.charCodeAt(0) - 0xAC00;
+                return index === needle.length - 1 && typed >= 0 && typed < 11172 && typed % 28 === 0 && Math.floor(code / 28) === Math.floor(typed / 28);
+            }));
+        });
+    }
+
+    refreshAutocomplete() {
+        if (!this.running) return;
+        const context = this.getAutocompleteContext();
+        if (!context || context.key === this.autocompleteDismissed) return this.closeAutocomplete();
+        const query = context.query.toLowerCase();
+        const items = [...this.knownItems.values()].filter(item => this.enabledGroupIds?.includes(item.groupId) && this.matchesAutocomplete(item.name, query));
+        items.sort((a,b) => Number(b.name.toLowerCase().startsWith(query)) - Number(a.name.toLowerCase().startsWith(query)));
+        if (!items.length) return this.closeAutocomplete();
+        const visibleItems = items.slice(0, 100);
+        const sameComposer = this.autocomplete && this.autocompleteContext?.composer === context.composer;
+        const sameResults = sameComposer && this.autocompleteTotal === items.length && visibleItems.length === this.autocompleteItems.length && visibleItems.every((item, index) => {
+            const previous = this.autocompleteItems[index];
+            return item.url === previous.url && item.name === previous.name && item.groupName === previous.groupName;
+        });
+        if (sameResults) { this.autocompleteContext = context; this.autocompleteItems = visibleItems; return; }
+        const preserve = sameComposer && this.autocompleteContext.query === context.query;
+        const scrollTop = preserve ? this.autocomplete.scrollTop : 0;
+        const selectedUrl = preserve ? this.autocompleteItems[this.autocompleteIndex]?.url : null;
+        this.closeAutocomplete();
+        this.autocompleteContext = context; this.autocompleteItems = visibleItems; this.autocompleteTotal = items.length;
+        this.autocompleteIndex = Math.max(0, visibleItems.findIndex(item => item.url === selectedUrl));
+        const panel = document.createElement('div'); panel.className = 'yuiko-autocomplete'; panel.setAttribute('role','listbox'); panel.setAttribute('aria-label','Yuiko 호출어');
+        panel.addEventListener('wheel', event => event.stopPropagation(), {passive:true});
+        panel.style.cssText = 'position:fixed;z-index:1001;box-sizing:border-box;background:var(--background-secondary,#232428);color:var(--text-normal,#eee);border:1px solid var(--background-modifier-accent,#41434a);border-radius:8px;box-shadow:0 8px 24px #0006;padding:8px;overflow-y:auto;';
+        panel.style.overscrollBehavior = 'contain';
+        const rect = context.composer.getBoundingClientRect();
+        panel.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - 248))}px`;
+        panel.style.width = `${Math.max(0, Math.min(Math.max(240, rect.width), innerWidth - 16))}px`;
+        panel.style.bottom = `${Math.max(8, innerHeight - rect.top + 8)}px`;
+        panel.style.maxHeight = `${Math.max(0, Math.min(360, rect.top - 16))}px`;
+        const heading = document.createElement('div'); heading.textContent = `Yuiko 호출어 · ${items.length}개${items.length > 100 ? ' (상위 100개)' : ''} · ↑↓ 이동 · Tab/Enter 선택`; heading.style.cssText = 'padding:6px 8px;font-size:12px;color:var(--text-muted,#aaa)'; panel.append(heading);
+        this.autocompleteItems.forEach((item, index) => {
+            const row = document.createElement('div'); row.setAttribute('role','option');
+            row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:8px;border-radius:4px;cursor:pointer;';
+            const image = document.createElement('img'); image.src = item.url; image.alt = ''; image.loading = 'lazy'; image.style.cssText = 'width:40px;height:40px;object-fit:contain;flex-shrink:0';
+            const label = document.createElement('div'); label.style.cssText = 'min-width:0;flex:1;overflow-wrap:anywhere';
+            const name = document.createElement('strong'); name.textContent = `.${item.name.split(',')[0].trim()}`;
+            const aliases = document.createElement('div'); aliases.textContent = item.name; aliases.style.cssText = 'font-size:12px;color:var(--text-muted,#aaa)'; label.append(name,aliases);
+            const group = document.createElement('span'); group.textContent = item.groupName || ''; group.style.cssText = 'font-size:12px;color:var(--text-muted,#aaa)';
+            row.append(image,label,group);
+            row.addEventListener('mousedown', event => event.preventDefault());
+            row.addEventListener('mousemove', () => { if (this.autocompleteIndex !== index) { this.autocompleteIndex = index; this.highlightAutocomplete(false); } });
+            row.addEventListener('click', () => { this.autocompleteIndex = index; this.acceptAutocomplete(); });
+            panel.append(row);
+        });
+        document.body.append(panel); this.autocomplete = panel; this.highlightAutocomplete(false);
+        panel.scrollTop = scrollTop;
+    }
+
+    highlightAutocomplete(scroll = true) {
+        this.autocomplete?.querySelectorAll('[role="option"]').forEach((row,index) => {
+            const selected = index === this.autocompleteIndex;
+            row.setAttribute('aria-selected', String(selected)); row.style.background = selected ? 'var(--background-modifier-selected,#404249)' : '';
+            if (selected && scroll) row.scrollIntoView?.({block:'nearest'});
+        });
+    }
+
+    acceptAutocomplete() {
+        if (this.autocompleteComposing) return;
+        const context = this.getAutocompleteContext();
+        const item = this.autocompleteItems?.[this.autocompleteIndex];
+        if (!context || context.composer !== this.autocompleteContext?.composer || context.key !== this.autocompleteContext?.key || !item) return this.closeAutocomplete();
+        const command = `.${item.name.split(',')[0].trim()}`;
+        this.closeAutocomplete();
+        const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(context.range);
+        const allowed = context.composer.dispatchEvent(new InputEvent('beforeinput', {bubbles:true,cancelable:true,inputType:'insertText',data:command}));
+        if (allowed && !document.execCommand('insertText',false,command)) BdApi.UI.showToast('Discord가 입력을 처리하지 못했습니다.', {type:'error'});
+        this.autocompleteDismissed = this.getAutocompleteContext()?.key;
+        this.closeAutocomplete();
     }
 
     getVersion() {
@@ -567,6 +724,7 @@ module.exports = class YuikoStickers {
         for (const item of items) this.knownItems.set(item.url, item);
         this.pruneStoredUrls();
         if (this.grid) this.render();
+        if (this.unbindAutocomplete) this.refreshAutocomplete();
     }
 
     async checkForUpdates(force = false) {
