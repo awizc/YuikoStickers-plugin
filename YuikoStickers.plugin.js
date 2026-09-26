@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.18.3
+ * @version 2.18.4
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -359,14 +359,22 @@ module.exports = class YuikoStickers {
         return entry.contiId ? (this.contis.find(conti => conti.id === entry.contiId)?.items || []).map(item => this.knownItems.get(item.url) || item) : [entry];
     }
 
+    getCallword(item) {
+        const group = item.groupName || item.groupname;
+        const number = Number(item.group_emoji_id);
+        if (group && Number.isSafeInteger(number) && number > 0) return `${group}_${number}`;
+        // Older caches kept the API's "callword///keywords" in name only.
+        return String(item.callword || item.word || item.name || '').split('///')[0].split(',')[0].trim();
+    }
+
     loadContis() {
         const saved = BdApi.Data.load(this.pluginName, 'contis');
         const aliases = new Set();
         this.contis = (Array.isArray(saved) ? saved : []).filter(conti => {
             if (!conti || typeof conti.id !== 'string' || typeof conti.name !== 'string' || !conti.name.trim() || conti.name.length > 40 || typeof conti.alias !== 'string' || !conti.alias || conti.alias.length > 30 || /[\s.,]/u.test(conti.alias) || aliases.has(conti.alias.toLowerCase())) return false;
-            if (!Array.isArray(conti.items) || conti.items.length < 2 || conti.items.length > 30 || conti.items.some(item => !item || typeof item.url !== 'string' || !/^https?:\/\//i.test(item.url) || typeof item.name !== 'string' || !item.name.split(',')[0].trim() || /[\s.]/u.test(item.name.split(',')[0].trim()))) return false;
+            if (!Array.isArray(conti.items) || conti.items.length < 2 || conti.items.length > 30 || conti.items.some(item => !item || typeof item.url !== 'string' || !/^https?:\/\//i.test(item.url) || typeof item.name !== 'string' || !this.getCallword(item) || /[.\r\n\t]/u.test(this.getCallword(item)))) return false;
             aliases.add(conti.alias.toLowerCase()); return true;
-        }).slice(0, 100).map((conti, index) => ({id:`conti-${index}`, name:conti.name.slice(0,40), alias:conti.alias.slice(0,30), items:conti.items.map(item => this.slimItem(item))}));
+        }).slice(0, 100).map((conti, index) => ({id:`conti-${index}`, name:conti.name.slice(0,40), alias:conti.alias.slice(0,30), items:conti.items.map(item => this.slimItem(this.knownItems.get(item.url) || item))}));
     }
 
     saveConti({id = null, name, alias, items}) {
@@ -374,7 +382,8 @@ module.exports = class YuikoStickers {
         if (!name || name.length > 40) throw new Error('콘티 이름은 1~40자로 입력하세요.');
         if (!alias || alias.length > 30 || /[\s.,]/u.test(alias)) throw new Error('호출어는 공백·점·쉼표 없이 1~30자로 입력하세요.');
         if (items.length < 2 || items.length > 30) throw new Error('콘티에는 콘을 2~30개 담아 주세요.');
-        if (items.some(item => !item?.url || !item.name?.split(',')[0].trim() || /[\s.]/u.test(item.name.split(',')[0].trim()))) throw new Error('사용할 수 없는 호출어가 포함되어 있습니다.');
+        items = items.map(item => this.knownItems.get(item?.url) || item);
+        if (items.some(item => !item?.url || !this.getCallword(item) || /[.\r\n\t]/u.test(this.getCallword(item)))) throw new Error('사용할 수 없는 호출어가 포함되어 있습니다.');
         if (this.contis.some(conti => conti.id !== id && conti.alias.toLowerCase() === alias.toLowerCase())) throw new Error('이미 사용 중인 콘티 호출어입니다.');
         if (!id && this.contis.length >= 100) throw new Error('콘티는 최대 100개까지 저장할 수 있습니다.');
         const conti = {id:id || `conti-${Date.now()}-${Math.random().toString(36).slice(2,8)}`, name, alias, items:items.map(item => this.slimItem(item))};
@@ -404,7 +413,7 @@ module.exports = class YuikoStickers {
         const list = document.createElement('div'); list.className = 'yuiko-conti-strip'; list.setAttribute('aria-label','콘 순서');
         items.forEach((item,index) => {
             const chip = document.createElement('div'); chip.className = 'yuiko-conti-chip'; chip.dataset.index = index;
-            chip.title = `${index+1}. ${item.name.split(',')[0]}${change ? ' · 드래그 또는 Alt+←/→로 이동' : ''}`;
+            chip.title = `${index+1}. ${this.getCallword(item)}${change ? ' · 드래그 또는 Alt+←/→로 이동' : ''}`;
             const image = document.createElement('img'); image.src = item.url; image.alt = item.name; image.draggable = false;
             const number = document.createElement('small'); number.textContent = index+1; chip.append(image,number);
             if (change) {
@@ -461,7 +470,7 @@ module.exports = class YuikoStickers {
         search.addEventListener('input', () => {
             results.replaceChildren(); if (!search.value.trim()) return;
             [...this.knownItems.values()].filter(item => this.matchesAutocomplete(item.name, search.value.trim())).slice(0,20).forEach(item => {
-                results.append(this.contiButton(item.name.split(',')[0], () => { if (draft.length < 30) { draft.push(item); redraw(); } }));
+                results.append(this.contiButton(this.getCallword(item), () => { if (draft.length < 30) { draft.push(item); redraw(); } }));
             });
         });
         const error = document.createElement('div'); error.className = 'yuiko-conti-error'; error.setAttribute('role','alert'); form.append(error);
@@ -507,14 +516,14 @@ module.exports = class YuikoStickers {
         const prefix = context.key.slice(0,-(context.query.length+1));
         if (!prefix) return [];
         const available = [...this.knownItems.values(),...this.contis.flatMap(conti => conti.items)];
-        const items = prefix.slice(1).split('.').map(word => available.find(item => item.name.split(',').some(alias => alias.trim() === word)));
+        const items = prefix.slice(1).split('.').map(word => available.find(item => this.getCallword(item) === word || item.name.split(',').some(alias => alias.trim() === word)));
         return items.every(Boolean) ? items : null;
     }
 
     renderDraftTray(context) {
         if (!this.autocomplete) return;
         const items = this.getDraftItems(context) || [];
-        const key = JSON.stringify(items.map(item => [item.url,item.name]));
+        const key = JSON.stringify(items.map(item => [item.url,item.name,this.getCallword(item)]));
         if (this.autocompleteTrayKey === key) return;
         const scrollLeft = this.autocomplete.querySelector('.yuiko-draft-tray .yuiko-conti-strip')?.scrollLeft || 0;
         this.autocompleteTrayCleanup?.(); this.autocompleteTrayCleanup = null;
@@ -526,8 +535,8 @@ module.exports = class YuikoStickers {
         if (items.length >= 2) heading.append(this.contiButton('🎬 콘티 저장',() => this.openContiEditor(items),true));
         const strip=this.createContiStrip(items,next => {
             const current=this.getAutocompleteContext();
-            if (!current || current.composer !== context.composer || JSON.stringify((this.getDraftItems(current) || []).map(item => [item.url,item.name])) !== key) return;
-            const command=next.map(item => `.${item.name.split(',')[0].trim()}`).join('')+`.${current.query}`;
+            if (!current || current.composer !== context.composer || JSON.stringify((this.getDraftItems(current) || []).map(item => [item.url,item.name,this.getCallword(item)])) !== key) return;
+            const command=next.map(item => `.${this.getCallword(item)}`).join('')+`.${current.query}`;
             const range=current.range.cloneRange(); range.selectNodeContents(current.composer); range.setEnd(current.range.endContainer,current.range.endOffset);
             this.replaceAutocomplete(current,range,command,command,false);
         });
@@ -595,13 +604,11 @@ module.exports = class YuikoStickers {
         if (after.toString()) return null;
         const before = caret.cloneRange(); before.selectNodeContents(composer); before.setEnd(caret.endContainer, caret.endOffset);
         const text = before.toString();
-        if (!text.startsWith(this.commandPrefix)) return null;
-        const match = /(?:^|\s)\.[^\s]*$/u.exec(text);
+        if (!text.startsWith(this.commandPrefix) || /[\r\n\t\u2028\u2029]/u.test(text)) return null;
         // Adjacent sticker commands also allow completing the last dot token.
         const start = text.lastIndexOf(this.commandPrefix);
-        if (start < 0 || !match) return null;
+        if (start < 0) return null;
         const query = text.slice(start + 1);
-        if (/\s/.test(query)) return null;
         const range = caret.cloneRange();
         const walker = document.createTreeWalker(composer, 4);
         let offset = 0, node;
@@ -624,7 +631,7 @@ module.exports = class YuikoStickers {
     matchesAutocomplete(name, query) {
         const initials = 'ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ';
         const needle = [...query.normalize('NFC').toLowerCase()];
-        return name.split(',').some(alias => {
+        return name.split(/,|\/\/\//u).some(alias => {
             const letters = [...alias.trim().normalize('NFC').toLowerCase()];
             return letters.some((_, start) => needle.every((char, index) => {
                 const candidate = letters[start + index];
@@ -660,12 +667,12 @@ module.exports = class YuikoStickers {
         }
         if (!context || context.key === this.autocompleteDismissed) return this.closeAutocomplete();
         const query = context.query.toLowerCase();
-        const items = [...this.knownItems.values()].filter(item => this.enabledGroupIds?.includes(item.groupId) && this.matchesAutocomplete(item.name, query));
+        const items = [...this.knownItems.values()].filter(item => this.enabledGroupIds?.includes(item.groupId) && this.matchesAutocomplete(`${this.getCallword(item)},${item.name}`, query));
         for (const conti of this.contis) {
             if (this.matchesAutocomplete(`${conti.alias},${conti.name}`,query)) items.push({contiId:conti.id,url:`conti:${conti.id}`,name:conti.alias,groupName:`🎬 ${conti.name} · 콘 ${conti.items.length}개`,items:conti.items});
         }
         const rank = item => {
-            const aliases = item.name.toLowerCase().split(',').map(alias => alias.trim());
+            const aliases = `${this.getCallword(item)},${item.name}`.toLowerCase().split(/,|\/\/\//u).map(alias => alias.trim());
             return aliases.includes(query) ? 0 : aliases.some(alias => alias.startsWith(query)) ? 1 : 2;
         };
         items.sort((a,b) => rank(a) - rank(b));
@@ -674,7 +681,7 @@ module.exports = class YuikoStickers {
         const sameComposer = this.autocomplete && this.autocompleteContext?.composer === context.composer;
         const sameResults = sameComposer && this.autocompleteTotal === items.length && visibleItems.length === this.autocompleteItems.length && visibleItems.every((item, index) => {
             const previous = this.autocompleteItems[index];
-            return item.url === previous.url && item.name === previous.name && item.groupName === previous.groupName;
+            return item.url === previous.url && item.name === previous.name && item.groupName === previous.groupName && this.getCallword(item) === this.getCallword(previous);
         });
         if (sameResults) { this.autocompleteContext = context; this.autocompleteItems = visibleItems; this.renderDraftTray(context); return; }
         const preserve = sameComposer && this.autocompleteContext.query === context.query;
@@ -700,7 +707,7 @@ module.exports = class YuikoStickers {
             if (item.contiId) { image.className='yuiko-conti-mini'; item.items.slice(0,3).forEach(entry => { const thumb=document.createElement('img'); thumb.src=entry.url; thumb.alt=''; image.append(thumb); }); }
             else { image.src = item.url; image.alt = ''; image.loading = 'lazy'; image.style.cssText = 'width:40px;height:40px;object-fit:contain;flex-shrink:0'; }
             const label = document.createElement('div'); label.style.cssText = 'min-width:0;flex:1;overflow-wrap:anywhere';
-            const name = document.createElement('strong'); name.textContent = `.${item.name.split(',')[0].trim()}`;
+            const name = document.createElement('strong'); name.textContent = `.${this.getCallword(item)}`;
             const aliases = document.createElement('div'); aliases.textContent = item.name; aliases.style.cssText = 'font-size:12px;color:var(--text-muted,#aaa)'; label.append(name,aliases);
             const group = document.createElement('span'); group.textContent = item.groupName || ''; group.style.cssText = 'font-size:12px;color:var(--text-muted,#aaa)';
             row.append(image,label,group);
@@ -728,7 +735,7 @@ module.exports = class YuikoStickers {
         if (!context || context.composer !== this.autocompleteContext?.composer || context.key !== this.autocompleteContext?.key || !item) return this.closeAutocomplete();
         const selectedItems = this.contiItems(item);
         if (!selectedItems.length) return this.closeAutocomplete();
-        const command = selectedItems.map(entry => `.${entry.name.split(',')[0].trim()}`).join('') + (keepSearch ? `.${context.query}` : '');
+        const command = selectedItems.map(entry => `.${this.getCallword(entry)}`).join('') + (keepSearch ? `.${context.query}` : '');
         this.replaceAutocomplete(context,context.range,command,context.key.slice(0,-(context.query.length+1))+command,!keepSearch,[...(this.getDraftItems(context) || []),...selectedItems]);
     }
 
@@ -1087,7 +1094,7 @@ module.exports = class YuikoStickers {
         const shown = Array.isArray(saved.shown) ? saved.shown.map(url => this.knownItems.get(url)).filter(Boolean) : Array.isArray(saved.items) ? saved.items.filter(valid).map(item => this.slimItem(item)) : [];
         this.applyItems(shown);
     }
-    slimItem(item) { return {url:item.url, name:String(item.name), groupId:Number(item.groupId ?? 0), groupName:String(item.groupName || '')}; }
+    slimItem(item) { return {url:item.url, name:String(item.name), groupId:Number(item.groupId ?? 0), groupName:String(item.groupName || ''), callword:this.getCallword(item)}; }
 
     saveCache() { BdApi.Data.save(this.pluginName, 'cache', {datetime:this.lastDatetime, known:[...this.knownItems.values()].map(item => this.slimItem(item)), shown:this.items.map(item => item.url)}); }
 
@@ -1285,7 +1292,7 @@ module.exports = class YuikoStickers {
         if (this.queuedItems.length >= 2) header.append(this.contiButton('🎬 콘티 저장',() => this.openContiEditor(this.queuedItems)));
         const list = document.createElement('div'); list.className = 'yuiko-queue-list'; list.setAttribute('role', 'list'); list.setAttribute('aria-label', '전송 대기 이모지');
         this.queuedItems.forEach((item, index) => {
-            const name = item.name.split(',')[0].trim();
+            const name = this.getCallword(item);
             const card = document.createElement('div'); card.className = 'yuiko-queue-item'; card.setAttribute('role', 'listitem'); card.title = `${index + 1}. ${name}`;
             const image = document.createElement('img'); image.src = item.url; image.alt = name; image.draggable = false;
             const number = document.createElement('span'); number.className = 'yuiko-queue-number'; number.textContent = String(index + 1);
@@ -1377,7 +1384,7 @@ module.exports = class YuikoStickers {
         const composer = this.composer;
         if (!composer?.isConnected) return BdApi.UI.showToast('Discord 메시지 입력창을 찾을 수 없습니다.', {type:'error'});
         const selectedItems = [...this.queuedItems, item];
-        const command = selectedItems.map(selected => `${this.commandPrefix}${selected.name.split(',')[0].trim()}`).join('');
+        const command = selectedItems.map(selected => `${this.commandPrefix}${this.getCallword(this.knownItems.get(selected.url) || selected)}`).join('');
         this.closePanel(); composer.focus(); const selection = window.getSelection();
         if (this.savedSelection && composer.contains(this.savedSelection.commonAncestorContainer)) { selection.removeAllRanges(); selection.addRange(this.savedSelection.cloneRange()); } else { const range = document.createRange(); range.selectNodeContents(composer); range.collapse(false); selection.removeAllRanges(); selection.addRange(range); }
         const allowed = composer.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, cancelable:true, inputType:'insertText', data:command}));
