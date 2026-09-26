@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.18.4
+ * @version 2.18.5
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -367,6 +367,14 @@ module.exports = class YuikoStickers {
         return String(item.callword || item.word || item.name || '').split('///')[0].split(',')[0].trim();
     }
 
+    getSearchKeywords(item) {
+        const callword = this.getCallword(item).toLowerCase();
+        const values = [item.name, item.word, ...(Array.isArray(item.keywords) ? item.keywords : [])];
+        return [...new Set(values.filter(value => typeof value === 'string').flatMap(value => value.split(/,|\/\/\//u)).map(value => value.trim()).filter(value => value && value.toLowerCase() !== callword))];
+    }
+
+    getSearchText(item) { return [this.getCallword(item), ...this.getSearchKeywords(item)].join(','); }
+
     loadContis() {
         const saved = BdApi.Data.load(this.pluginName, 'contis');
         const aliases = new Set();
@@ -469,7 +477,7 @@ module.exports = class YuikoStickers {
         const results = document.createElement('div'); results.className = 'yuiko-conti-add-results'; form.append(results);
         search.addEventListener('input', () => {
             results.replaceChildren(); if (!search.value.trim()) return;
-            [...this.knownItems.values()].filter(item => this.matchesAutocomplete(item.name, search.value.trim())).slice(0,20).forEach(item => {
+            [...this.knownItems.values()].filter(item => this.matchesAutocomplete(this.getSearchText(item), search.value.trim())).slice(0,20).forEach(item => {
                 results.append(this.contiButton(this.getCallword(item), () => { if (draft.length < 30) { draft.push(item); redraw(); } }));
             });
         });
@@ -667,12 +675,12 @@ module.exports = class YuikoStickers {
         }
         if (!context || context.key === this.autocompleteDismissed) return this.closeAutocomplete();
         const query = context.query.toLowerCase();
-        const items = [...this.knownItems.values()].filter(item => this.enabledGroupIds?.includes(item.groupId) && this.matchesAutocomplete(`${this.getCallword(item)},${item.name}`, query));
+        const items = [...this.knownItems.values()].filter(item => this.enabledGroupIds?.includes(item.groupId) && this.matchesAutocomplete(this.getSearchText(item), query));
         for (const conti of this.contis) {
-            if (this.matchesAutocomplete(`${conti.alias},${conti.name}`,query)) items.push({contiId:conti.id,url:`conti:${conti.id}`,name:conti.alias,groupName:`🎬 ${conti.name} · 콘 ${conti.items.length}개`,items:conti.items});
+            if (this.matchesAutocomplete(`${conti.alias},${conti.name}`,query)) items.push({contiId:conti.id,url:`conti:${conti.id}`,name:conti.alias,keywords:[conti.name],groupName:`🎬 ${conti.name} · 콘 ${conti.items.length}개`,items:conti.items});
         }
         const rank = item => {
-            const aliases = `${this.getCallword(item)},${item.name}`.toLowerCase().split(/,|\/\/\//u).map(alias => alias.trim());
+            const aliases = this.getSearchText(item).toLowerCase().split(',');
             return aliases.includes(query) ? 0 : aliases.some(alias => alias.startsWith(query)) ? 1 : 2;
         };
         items.sort((a,b) => rank(a) - rank(b));
@@ -681,7 +689,7 @@ module.exports = class YuikoStickers {
         const sameComposer = this.autocomplete && this.autocompleteContext?.composer === context.composer;
         const sameResults = sameComposer && this.autocompleteTotal === items.length && visibleItems.length === this.autocompleteItems.length && visibleItems.every((item, index) => {
             const previous = this.autocompleteItems[index];
-            return item.url === previous.url && item.name === previous.name && item.groupName === previous.groupName && this.getCallword(item) === this.getCallword(previous);
+            return item.url === previous.url && item.name === previous.name && item.groupName === previous.groupName && this.getSearchText(item) === this.getSearchText(previous);
         });
         if (sameResults) { this.autocompleteContext = context; this.autocompleteItems = visibleItems; this.renderDraftTray(context); return; }
         const preserve = sameComposer && this.autocompleteContext.query === context.query;
@@ -708,7 +716,7 @@ module.exports = class YuikoStickers {
             else { image.src = item.url; image.alt = ''; image.loading = 'lazy'; image.style.cssText = 'width:40px;height:40px;object-fit:contain;flex-shrink:0'; }
             const label = document.createElement('div'); label.style.cssText = 'min-width:0;flex:1;overflow-wrap:anywhere';
             const name = document.createElement('strong'); name.textContent = `.${this.getCallword(item)}`;
-            const aliases = document.createElement('div'); aliases.textContent = item.name; aliases.style.cssText = 'font-size:12px;color:var(--text-muted,#aaa)'; label.append(name,aliases);
+            const aliases = document.createElement('div'); aliases.textContent = this.getSearchKeywords(item).join(', '); aliases.style.cssText = 'font-size:12px;color:var(--text-muted,#aaa)'; label.append(name,aliases);
             const group = document.createElement('span'); group.textContent = item.groupName || ''; group.style.cssText = 'font-size:12px;color:var(--text-muted,#aaa)';
             row.append(image,label,group);
             row.addEventListener('mousedown', event => event.preventDefault());
@@ -918,6 +926,8 @@ module.exports = class YuikoStickers {
             this.saveGroupSettings();
             await this.loadGroupItems();
             if (!isCurrent()) return false;
+            await this.loadMissingSearchKeywords(isCurrent);
+            if (!isCurrent()) return false;
             await this.loadGroupThumbsFromServer();
             if (!isCurrent()) return false;
             if (this.panel) {
@@ -934,21 +944,50 @@ module.exports = class YuikoStickers {
         }
     }
 
+    async fetchGroupItems(id) {
+        const response = await this.fetchWithVersion(this.apiBase+'group/'+id);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const items = await response.json();
+        if (!Array.isArray(items) || items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('올바르지 않은 이모지 목록 응답');
+        const groupName = this.groups.find(group => group.id === id)?.name || `그룹 ${id}`;
+        return items.map(item => {
+            const normalized = {...item, name:String(item.word || item.name || ''), groupId:id, groupName, url:item.url || `https://snow.modaweb.kr/project/emoji/${String(item.id).padStart(2, '0')}.${item.ext}`};
+            normalized.keywords = this.getSearchKeywords(normalized);
+            return normalized;
+        });
+    }
+
+    async loadMissingSearchKeywords(isCurrent) {
+        let changed = false;
+        await Promise.all((this.enabledGroupIds || []).map(async id => {
+            const cached = [...this.knownItems.values()].filter(item => item.groupId === id);
+            const count = this.groups.find(group => group.id === id)?.count;
+            if (cached.length === count && cached.every(item => Array.isArray(item.keywords))) return;
+            try {
+                const items = await this.fetchGroupItems(id);
+                if (!isCurrent() || !this.enabledGroupIds.includes(id) || !items.length) return;
+                const current = [...this.knownItems.values()].filter(item => item.groupId === id);
+                // A newer tab request owns its result; do not overwrite it with this index refresh.
+                if (current.length !== cached.length || current.some((item,index) => item !== cached[index])) return;
+                const urls = new Set(items.map(item => item.url));
+                for (const item of cached) if (!urls.has(item.url)) this.knownItems.delete(item.url);
+                for (const item of items) this.knownItems.set(item.url,item);
+                changed = true;
+            } catch (error) {
+                if (isCurrent()) console.warn('[YuikoStickers] 검색어 갱신 실패:',id,error.message);
+            }
+        }));
+        if (changed && isCurrent()) this.applyItems(this.items.map(item => this.knownItems.get(item.url)).filter(Boolean));
+    }
+
     async loadGroupItems() {
         const sessionId = this.sessionId;
         const token = ++this.loadToken;
         const isCurrent = () => this.isCurrentSession(sessionId) && token === this.loadToken;
         const ids = this.selectedGroupId === null ? this.sortIdsByGroupOrder(this.enabledGroupIds || []) : [this.selectedGroupId];
-        const groupMap = new Map(this.groups.map(group => [group.id, group]));
         let responses;
         try {
-            responses = await Promise.all(ids.map(async id => {
-                const response = await this.fetchWithVersion(this.apiBase+'group/'+id);
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const items = await response.json();
-                if (!Array.isArray(items) || items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('올바르지 않은 이모지 목록 응답');
-                return items.map(item => ({...item, name:String(item.word || item.name || ''), groupId:id, groupName:groupMap.get(id)?.name || `그룹 ${id}`, url:item.url || `https://snow.modaweb.kr/project/emoji/${String(item.id).padStart(2, '0')}.${item.ext}`}));
-            }));
+            responses = await Promise.all(ids.map(id => this.fetchGroupItems(id)));
         } catch (error) {
             if (!isCurrent()) return false;
             throw error;
@@ -1094,7 +1133,11 @@ module.exports = class YuikoStickers {
         const shown = Array.isArray(saved.shown) ? saved.shown.map(url => this.knownItems.get(url)).filter(Boolean) : Array.isArray(saved.items) ? saved.items.filter(valid).map(item => this.slimItem(item)) : [];
         this.applyItems(shown);
     }
-    slimItem(item) { return {url:item.url, name:String(item.name), groupId:Number(item.groupId ?? 0), groupName:String(item.groupName || ''), callword:this.getCallword(item)}; }
+    slimItem(item) {
+        const saved = {url:item.url, name:String(item.name), groupId:Number(item.groupId ?? 0), groupName:String(item.groupName || ''), callword:this.getCallword(item)};
+        if (Array.isArray(item.keywords)) saved.keywords = this.getSearchKeywords(item);
+        return saved;
+    }
 
     saveCache() { BdApi.Data.save(this.pluginName, 'cache', {datetime:this.lastDatetime, known:[...this.knownItems.values()].map(item => this.slimItem(item)), shown:this.items.map(item => item.url)}); }
 
@@ -1353,9 +1396,9 @@ module.exports = class YuikoStickers {
         this.hidePreview();
         const fragment = document.createDocumentFragment();
         const query = filter.trim().toLowerCase();
-        const items = this.items.filter(item => !query || item.name.toLowerCase().includes(query));
+        const items = this.items.filter(item => !query || this.getSearchText(item).toLowerCase().includes(query));
         // 즐겨찾기는 현재 그룹과 관계없이 전부 표시
-        const favoriteItems = [...this.favorites].map(url => this.knownItems.get(url)).filter(item => item && (!query || item.name.toLowerCase().includes(query)));
+        const favoriteItems = [...this.favorites].map(url => this.knownItems.get(url)).filter(item => item && (!query || this.getSearchText(item).toLowerCase().includes(query)));
         if (favoriteItems.length) { fragment.appendChild(this.createSection(`즐겨찾기 ${favoriteItems.length}`)); favoriteItems.forEach(item => fragment.appendChild(this.createItem(item, 'fav'))); }
         fragment.appendChild(this.createSection(`${this.selectedGroupId === null ? '선택 그룹' : this.groups.find(group => group.id === this.selectedGroupId)?.name || '그룹'} · 전체 ${items.length}`, true));
         this.sortItems(items).forEach(item => fragment.appendChild(this.createItem(item)));
