@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.18.5
+ * @version 2.18.6
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -680,8 +680,9 @@ module.exports = class YuikoStickers {
             if (this.matchesAutocomplete(`${conti.alias},${conti.name}`,query)) items.push({contiId:conti.id,url:`conti:${conti.id}`,name:conti.alias,keywords:[conti.name],groupName:`🎬 ${conti.name} · 콘 ${conti.items.length}개`,items:conti.items});
         }
         const rank = item => {
+            if (this.getCallword(item).toLowerCase() === query) return 0;
             const aliases = this.getSearchText(item).toLowerCase().split(',');
-            return aliases.includes(query) ? 0 : aliases.some(alias => alias.startsWith(query)) ? 1 : 2;
+            return aliases.includes(query) ? 1 : aliases.some(alias => alias.startsWith(query)) ? 2 : 3;
         };
         items.sort((a,b) => rank(a) - rank(b));
         if (!items.length && !this.getDraftItems(context)?.length) return this.closeAutocomplete();
@@ -924,15 +925,16 @@ module.exports = class YuikoStickers {
             this.enabledGroupIds = this.enabledGroupIds.filter(id => available.has(id));
             if (this.selectedGroupId !== null && !available.has(this.selectedGroupId)) this.selectedGroupId = null;
             this.saveGroupSettings();
-            await this.loadGroupItems();
+            const selectedIds = this.selectedGroupId === null ? [...this.enabledGroupIds] : [this.selectedGroupId];
+            const loaded = await this.loadGroupItems();
             if (!isCurrent()) return false;
-            await this.loadMissingSearchKeywords(isCurrent);
+            await this.loadMissingSearchKeywords(isCurrent, force, loaded ? selectedIds : []);
             if (!isCurrent()) return false;
             await this.loadGroupThumbsFromServer();
             if (!isCurrent()) return false;
             if (this.panel) {
                 this.renderGroupControls();
-                this.render();
+                this.render(this.searchInput?.value || '');
             }
             this.saveCache();
             return true;
@@ -957,12 +959,13 @@ module.exports = class YuikoStickers {
         });
     }
 
-    async loadMissingSearchKeywords(isCurrent) {
+    async loadMissingSearchKeywords(isCurrent, force = false, loadedIds = []) {
         let changed = false;
         await Promise.all((this.enabledGroupIds || []).map(async id => {
+            if (loadedIds.includes(id)) return;
             const cached = [...this.knownItems.values()].filter(item => item.groupId === id);
             const count = this.groups.find(group => group.id === id)?.count;
-            if (cached.length === count && cached.every(item => Array.isArray(item.keywords))) return;
+            if (!force && cached.length === count && cached.every(item => Array.isArray(item.keywords))) return;
             try {
                 const items = await this.fetchGroupItems(id);
                 if (!isCurrent() || !this.enabledGroupIds.includes(id) || !items.length) return;
@@ -1091,7 +1094,7 @@ module.exports = class YuikoStickers {
         }
         for (const item of items) this.knownItems.set(item.url, item);
         this.pruneStoredUrls();
-        if (this.grid) this.render();
+        if (this.grid) this.render(this.searchInput?.value || '');
         if (this.unbindAutocomplete) this.refreshAutocomplete();
     }
 
