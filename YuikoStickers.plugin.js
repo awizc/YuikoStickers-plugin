@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.18.10
+ * @version 2.20.0
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -91,6 +91,15 @@ module.exports = class YuikoStickers {
         this.composer = null;
         this.savedSelection = null;
         this.onDocumentMouseDown = null;
+        this.fileCache = null;
+        this.imageBindings = new WeakMap();
+        this.imageURLs = new Map();
+        this.imageRequests = new Map();
+        this.imageEpoch = 0;
+        this.clearingCache = false;
+        this.imageFailures = new Map();
+        this.cacheWarmup = null;
+        this.cacheWarmupTimer = null;
     }
 
     start() {
@@ -114,6 +123,7 @@ module.exports = class YuikoStickers {
     }
 
     stop() {
+        this.closePluginSettings();
         this.closeContiEditor();
         this.contiView = false;
         this.unbindAutocomplete?.();
@@ -124,6 +134,8 @@ module.exports = class YuikoStickers {
         this.loadToken++;
         this.groupsLoadToken++;
         this.cancelApiRequests();
+        this.releaseCachedImages();
+        this.fileCache?.cancelCompaction();
         this.groupsRequest = this.latestRequest = null;
         this.updateInFlight = false;
         this.cancelLongPress();
@@ -433,7 +445,7 @@ module.exports = class YuikoStickers {
         items.forEach((item,index) => {
             const chip = document.createElement('div'); chip.className = 'yuiko-conti-chip'; chip.dataset.index = index;
             chip.title = `${index+1}. ${this.getCallword(item)}${change ? ' · 드래그 또는 Alt+←/→로 이동' : ''}`;
-            const image = document.createElement('img'); image.src = item.url; image.alt = item.name; image.draggable = false;
+            const image = document.createElement('img'); this.setCachedImage(image,item.url); image.alt = item.name; image.draggable = false;
             const number = document.createElement('small'); number.textContent = index+1; chip.append(image,number);
             if (change) {
                 chip.tabIndex = 0; chip.setAttribute('role','group'); chip.setAttribute('aria-label',chip.title);
@@ -740,8 +752,8 @@ module.exports = class YuikoStickers {
             const row = document.createElement('div'); row.setAttribute('role','option');
             row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:8px;border-radius:4px;cursor:pointer;';
             const image = document.createElement(item.contiId ? 'span' : 'img');
-            if (item.contiId) { image.className='yuiko-conti-mini'; item.items.slice(0,3).forEach(entry => { const thumb=document.createElement('img'); thumb.src=entry.url; thumb.alt=''; image.append(thumb); }); }
-            else { image.src = item.url; image.alt = ''; image.loading = 'lazy'; image.style.cssText = 'width:40px;height:40px;object-fit:contain;flex-shrink:0'; }
+            if (item.contiId) { image.className='yuiko-conti-mini'; item.items.slice(0,3).forEach(entry => { const thumb=document.createElement('img'); this.setCachedImage(thumb,entry.url); thumb.alt=''; image.append(thumb); }); }
+            else { this.setCachedImage(image,item.url); image.alt = ''; image.loading = 'lazy'; image.style.cssText = 'width:40px;height:40px;object-fit:contain;flex-shrink:0'; }
             const label = document.createElement('div'); label.style.cssText = 'min-width:0;flex:1;overflow-wrap:anywhere';
             const name = document.createElement('strong'); name.textContent = `.${this.getCallword(item)}`;
             const aliases = document.createElement('div'); aliases.textContent = this.getSearchKeywords(item).join(', '); aliases.style.cssText = 'font-size:12px;color:var(--text-muted,#aaa)'; label.append(name,aliases);
@@ -945,7 +957,7 @@ module.exports = class YuikoStickers {
     }
 
     createApiState() {
-        return {pending:new Map(), queue:[], active:0, failures:0, cooldownUntil:0, lastError:''};
+        return {pending:new Map(), queue:[], active:0, activeCatalog:0, failures:0, cooldownUntil:0, lastError:''};
     }
 
     cancelApiRequests() {
@@ -964,13 +976,22 @@ module.exports = class YuikoStickers {
     }
 
     fetchApiJson(endpoint) {
+        return this.enqueueServerRequest(endpoint);
+    }
+
+    enqueueServerRequest(endpoint, imageURL = null, background = false) {
         const state = this.apiState;
         if (!this.running) return Promise.reject(new Error('플러그인이 종료되었습니다.'));
-        if (state.pending.has(endpoint)) return state.pending.get(endpoint).promise;
+        if (state.pending.has(endpoint)) {
+            const job=state.pending.get(endpoint);
+            if (!background && job.priority>1) { job.priority=1; state.queue.sort((a,b)=>a.priority-b.priority); }
+            return job.promise;
+        }
         if (Date.now() < state.cooldownUntil) return Promise.reject(this.apiCooldownError(state));
-        const job = {endpoint};
+        const job = {endpoint, imageURL, priority:imageURL ? (background ? 2 : 1) : 0};
         job.promise = new Promise((resolve,reject) => { job.resolve=resolve; job.reject=reject; });
         state.pending.set(endpoint,job); state.queue.push(job);
+        state.queue.sort((a,b)=>a.priority-b.priority);
         this.drainApiQueue(state);
         return job.promise;
     }
@@ -981,37 +1002,65 @@ module.exports = class YuikoStickers {
             for (const job of state.queue.splice(0)) { state.pending.delete(job.endpoint); job.reject(this.apiCooldownError(state)); }
             return;
         }
-        // Lists, thumbnails and previews share the same two request slots.
-        while (state.active < 2 && state.queue.length) this.runApiRequest(state,state.queue.shift());
+        // Four total transfers, at most two catalog requests. Visible images and
+        // catalog work take the next free slot before background cache filling.
+        while (state.active < 4 && state.queue.length) {
+            const index=state.queue.findIndex(job=>job.imageURL || state.activeCatalog<2);
+            if (index<0) break;
+            this.runApiRequest(state,state.queue.splice(index,1)[0]);
+        }
     }
 
     async runApiRequest(state, job) {
         state.active++;
+        if (!job.imageURL) state.activeCatalog++;
         const failuresAtStart = state.failures;
         job.controller = new window.AbortController();
         try {
-            const response = await this.fetchWithVersion(this.apiBase+job.endpoint,job.controller.signal);
+            const cached=job.imageURL ? this.fileCache?.getImage(job.imageURL) : null;
+            const imageHeaders={};
+            if (cached?.etag) imageHeaders['If-None-Match']=cached.etag;
+            else if (cached?.lastModified) imageHeaders['If-Modified-Since']=cached.lastModified;
+            const response = job.imageURL
+                ? await BdApi.Net.fetch(job.imageURL,{timeout:15000,signal:job.controller.signal,headers:imageHeaders,cache:'no-cache'})
+                : await this.fetchWithVersion(this.apiBase+job.endpoint,job.controller.signal);
             if (state !== this.apiState || !this.running) return;
-            if (!response.ok) {
+            const notModified=job.imageURL && response.status===304 && cached;
+            if (!response.ok && !notModified) {
                 const error = new Error(`HTTP ${response.status}`);
+                error.status=response.status;
                 const retryAfter = response.headers?.get?.('Retry-After');
                 const delay = retryAfter == null ? 0 : /^\d+(\.\d+)?$/.test(retryAfter) ? Number(retryAfter)*1000 : Date.parse(retryAfter)-Date.now();
                 error.retryAfter = Number.isFinite(delay) ? Math.max(0,delay) : 0;
                 throw error;
             }
-            const data = await response.json();
+            let data;
+            if (notModified) {
+                data={notModified:true,cached,etag:response.headers?.get?.('ETag') || cached.etag,lastModified:response.headers?.get?.('Last-Modified') || cached.lastModified};
+            } else if (job.imageURL) {
+                if (Number(response.headers?.get?.('Content-Length')) > YuikoCacheFile.maxImageBytes) throw new Error('이미지 용량 초과');
+                const bytes = new Uint8Array(await response.arrayBuffer());
+                const mime = YuikoCacheFile.imageType(bytes);
+                if (!mime || !bytes.length || bytes.length > YuikoCacheFile.maxImageBytes) throw new Error('올바른 이미지 응답이 아닙니다.');
+                data = {bytes,mime,etag:response.headers?.get?.('ETag') || null,lastModified:response.headers?.get?.('Last-Modified') || null};
+            } else data = await response.json();
             if (state !== this.apiState || !this.running) return;
             // A success already in flight must not undo another request's cooldown.
             if (state.failures === failuresAtStart && Date.now() >= state.cooldownUntil) { state.failures=0; state.cooldownUntil=0; }
             job.resolve(data);
         } catch (error) {
             if (state !== this.apiState || !this.running) return;
+            // One removed image must not put the entire catalog into backoff.
+            if (job.imageURL && (error.status===404 || error.status===410)) {
+                job.reject(error); return;
+            }
             const delay = Math.max(Math.min(300000,30000*2**Math.min(state.failures++,4)),error.retryAfter || 0);
             state.cooldownUntil = Math.max(state.cooldownUntil,Date.now()+delay);
             state.lastError = error.message;
             job.reject(this.apiCooldownError(state));
         } finally {
             state.active--;
+            if (!job.imageURL) state.activeCatalog--;
             if (state.pending.get(job.endpoint) === job) state.pending.delete(job.endpoint);
             this.drainApiQueue(state);
         }
@@ -1138,6 +1187,8 @@ module.exports = class YuikoStickers {
             if (!this.isCurrentSession(sessionId) || token !== this.loadToken) return;
             console.warn('[YuikoStickers] 그룹 이모지 로딩 실패:', error);
             if (!this.contiView) this.setStatusError(`그룹을 불러오지 못했습니다: ${error.message || '알 수 없는 오류'} · 클릭하여 재시도`);
+        } finally {
+            if (this.isCurrentSession(sessionId)) this.scheduleCacheWarmup();
         }
     }
 
@@ -1205,8 +1256,8 @@ module.exports = class YuikoStickers {
             ? Object.fromEntries(Object.entries(saved).filter(([,url]) => typeof url === 'string'))
             : {};
     }
-    saveGroupThumbs() { BdApi.Data.save(this.pluginName, 'groupThumbs', this.groupThumbs); }
-    createGroupThumb(group, className) { const url = this.groupThumbs[group.id]; if (!url) return null; const image = document.createElement('img'); image.className = className; image.src = url; image.alt = group.name; image.loading = 'lazy'; return image; }
+    saveGroupThumbs() { this.saveCache(); }
+    createGroupThumb(group, className) { const url = this.groupThumbs[group.id]; if (!url) return null; const image = document.createElement('img'); image.className = className; this.setCachedImage(image,url); image.alt = group.name; image.loading = 'lazy'; return image; }
 
     /**
      * @param items 화면에 표시할 이모지
@@ -1220,7 +1271,7 @@ module.exports = class YuikoStickers {
             for (const [url, item] of this.knownItems) if (loaded.has(item.groupId) && !this.itemByUrl.has(url)) this.knownItems.delete(url);
         }
         for (const item of items) this.knownItems.set(item.url, item);
-        this.pruneStoredUrls();
+        // Missing cached metadata must never remove personal favorites or recent history.
         this.clearStatusError();
         if (this.grid) this.render(this.searchInput?.value || '');
         if (this.unbindAutocomplete) this.refreshAutocomplete();
@@ -1254,6 +1305,8 @@ module.exports = class YuikoStickers {
             if (!this.isCurrentSession(sessionId)) return;
             console.warn('[YuikoStickers] 갱신 확인 실패:', error.message);
             if (!this.items.length) this.setStatusError(`서버에 연결하지 못했습니다: ${error.message} · 클릭하여 재시도`);
+        } finally {
+            if (this.isCurrentSession(sessionId)) this.scheduleCacheWarmup();
         }
     }
     setStatusError(message) { this.statusError = message; if (!this.status) return; this.status.textContent = message; this.status.classList.add('is-error'); }
@@ -1264,8 +1317,23 @@ module.exports = class YuikoStickers {
      * known에는 지금까지 본 모든 이모지를 필요한 필드만, shown에는 마지막으로 표시 중이던 이모지 URL만 저장 (중복 저장 방지)
      */
     loadCache() {
-        const saved = BdApi.Data.load(this.pluginName, 'cache');
+        let saved;
+        try {
+            this.fileCache ??= new YuikoCacheFile(require('fs'),require('path').join(BdApi.Plugins.folder,`${this.pluginName}.cache`));
+            saved = this.fileCache.catalog;
+        } catch (error) {
+            console.warn('[YuikoStickers] 캐시 파일 읽기 실패:',error);
+            BdApi.UI.showToast('캐시 파일을 읽지 못했습니다. 설정에서 캐시 삭제 후 다시 받을 수 있습니다.',{type:'error'});
+        }
+        saved ??= BdApi.Data.load(this.pluginName, 'cache');
         if (!saved) return;
+        this.restoreCatalog(saved);
+        if (this.fileCache) this.saveCache();
+    }
+
+    restoreCatalog(saved) {
+        if (!saved || typeof saved !== 'object') return;
+        if (saved.groupThumbs && typeof saved.groupThumbs === 'object') this.groupThumbs = {...saved.groupThumbs};
         this.lastDatetime = saved.datetime ?? null;
         if (Array.isArray(saved.groups) && saved.groups.every(group => group && Number.isSafeInteger(group.id) && group.id >= 0 && typeof group.name === 'string' && Number.isFinite(group.count) && group.count >= 0)) {
             this.groups = saved.groups.map(group => ({id:group.id,name:group.name,description:String(group.description || ''),count:group.count}));
@@ -1285,7 +1353,338 @@ module.exports = class YuikoStickers {
         return saved;
     }
 
-    saveCache() { BdApi.Data.save(this.pluginName, 'cache', {datetime:this.lastDatetime, groups:this.groups, known:[...this.knownItems.values()].map(item => this.slimItem(item)), shown:this.items.map(item => item.url)}); }
+    saveCache() {
+        if (this.clearingCache) return;
+        try {
+            this.fileCache ??= new YuikoCacheFile(require('fs'),require('path').join(BdApi.Plugins.folder,`${this.pluginName}.cache`));
+            this.fileCache.saveCatalog({datetime:this.lastDatetime,groups:this.groups,groupThumbs:this.groupThumbs,known:[...this.knownItems.values()].map(item => this.slimItem(item)),shown:this.items.map(item => item.url)});
+            // Only discard the old copy after the new file was successfully written.
+            BdApi.Data.delete(this.pluginName,'cache');
+            BdApi.Data.delete(this.pluginName,'groupThumbs');
+        } catch (error) { this.reportCacheWriteError(error); }
+    }
+
+    reportCacheWriteError(error) {
+        console.warn('[YuikoStickers] 캐시 저장 실패:',error);
+        if (this.cacheWriteErrorShown) return;
+        this.cacheWriteErrorShown = true;
+        BdApi.UI.showToast('이미지 캐시 저장에 실패했습니다. 디스크 공간과 폴더 권한을 확인해 주세요.',{type:'error'});
+    }
+
+    requestCachedImage(url, background=false) {
+        const epoch=this.imageEpoch, revision=this.lastDatetime;
+        const key=`${epoch}:${url}`;
+        const existing=this.imageRequests.get(key);
+        if (existing) {
+            if (!background) {
+                const job=this.apiState.pending.get(`image:${url}`);
+                if (job) { job.priority=1; this.apiState.queue.sort((a,b)=>a.priority-b.priority); }
+            }
+            return existing;
+        }
+        const failure=this.imageFailures.get(url);
+        if (failure && failure.revision===revision && failure.until>Date.now()) return Promise.reject(new Error('이미지 재시도 대기 중'));
+        const request=this.enqueueServerRequest(`image:${url}`,url,background).then(data => {
+            if (!this.running || this.imageEpoch!==epoch) return null;
+            this.imageFailures.delete(url);
+            if (data.notModified) {
+                try { return this.fileCache.validateImage(url,data.cached,{revision,etag:data.etag,lastModified:data.lastModified}); }
+                catch (error) { this.reportCacheWriteError(error); return data.cached; }
+            }
+            const entry={...data,revision,verified:true};
+            try { return this.fileCache.putImage(url,entry); }
+            catch (error) { this.reportCacheWriteError(error); return entry; }
+        },error => {
+            if (this.imageEpoch===epoch) this.imageFailures.set(url,{revision,until:error.status===404 || error.status===410 ? Date.now()+30*60*1000 : Math.max(Date.now()+30000,this.apiState.cooldownUntil)});
+            throw error;
+        });
+        this.imageRequests.set(key,request);
+        const done=()=>{if (this.imageRequests.get(key)===request) this.imageRequests.delete(key);};
+        request.then(done,done);
+        return request;
+    }
+
+    scheduleCacheWarmup() {
+        if (!this.running || !this.fileCache || this.clearingCache || this.manualRefreshRequest) return;
+        if (this.cacheWarmup) { this.cacheWarmup.rescan=true; return; }
+        if (this.cacheWarmupTimer) return;
+        this.cacheWarmupTimer=setTimeout(()=>{this.cacheWarmupTimer=null;this.startCacheWarmup();},200);
+    }
+
+    startCacheWarmup() {
+        if (!this.running || !this.fileCache || this.cacheWarmup || this.clearingCache || this.manualRefreshRequest || Date.now()<this.apiState.cooldownUntil || this.cacheWriteErrorShown) return;
+        const enabled=new Set(this.enabledGroupIds || []);
+        const candidates=[...this.knownItems.values()].filter(item=>enabled.has(item.groupId));
+        candidates.sort((a,b)=>Number(this.favorites.has(b.url))-Number(this.favorites.has(a.url)) || Number(b.groupId===this.selectedGroupId)-Number(a.groupId===this.selectedGroupId));
+        const urls=[...new Set(candidates.map(item=>item.url))].filter(url=>{
+            const stored=this.fileCache.images.get(url), failure=this.imageFailures.get(url);
+            return /^https?:\/\//i.test(url) && (!stored || stored.revision!==this.lastDatetime) && !(failure && failure.revision===this.lastDatetime && failure.until>Date.now());
+        });
+        const state={epoch:this.imageEpoch,urls,index:0,active:0,rescan:false};
+        this.cacheWarmup=state;
+        this.pumpCacheWarmup(state);
+    }
+
+    pumpCacheWarmup(state) {
+        if (this.cacheWarmup!==state || !this.running || state.epoch!==this.imageEpoch) return;
+        if (Date.now()<this.apiState.cooldownUntil || this.cacheWriteErrorShown || this.fileCache.size>=YuikoCacheFile.limit) { this.cacheWarmup=null; return; }
+        while (state.active<4 && state.index<state.urls.length) {
+            const url=state.urls[state.index++], item=this.knownItems.get(url);
+            if (!item || !this.enabledGroupIds?.includes(item.groupId)) continue;
+            const stored=this.fileCache.images.get(url);
+            if (stored && stored.revision===this.lastDatetime) continue;
+            state.active++;
+            this.requestCachedImage(url,true).then(entry=>{
+                // Capacity or a write failure must not trigger endless re-downloads.
+                if (entry && this.fileCache.images.get(url)!==entry && this.cacheWarmup===state) this.cacheWarmup=null;
+            },()=>{}).finally(()=>{
+                state.active--;
+                this.pumpCacheWarmup(state);
+            });
+        }
+        if (!state.active && state.index===state.urls.length) {
+            this.cacheWarmup=null;
+            if (state.rescan) this.scheduleCacheWarmup();
+        }
+    }
+
+    setCachedImage(image, url) {
+        if (!url) return;
+        image.dataset.yuikoImage = url;
+        const binding = {url,epoch:this.imageEpoch};
+        this.imageBindings.set(image,binding);
+        if (!this.fileCache || !window.URL.createObjectURL) { image.src=url; return; }
+        const load = () => {
+            if (!this.running || this.imageBindings.get(image) !== binding) return;
+            const cached = this.fileCache.getImage(url);
+            if (cached) this.displayCachedImage(image,binding,cached);
+            if (cached && cached.revision === this.lastDatetime) return;
+            this.requestCachedImage(url).then(entry => { if (entry) this.displayCachedImage(image,binding,entry); },() => {
+                if (!cached && this.imageBindings.get(image) === binding) image.title='이미지를 받지 못했습니다. 서버 연결 후 다시 열어 주세요.';
+            });
+        };
+        binding.load=load;
+        if (window.IntersectionObserver) {
+            this.imageObserver ??= new window.IntersectionObserver(entries => {
+                for (const entry of entries) if (entry.isIntersecting) {
+                    this.imageObserver.unobserve(entry.target);
+                    this.observedImages?.delete(entry.target);
+                    this.imageBindings.get(entry.target)?.load();
+                }
+            });
+            this.imageObserver.observe(image);
+            (this.observedImages ??= new Set()).add(image);
+            if (!this.imageCleanupTimer) this.imageCleanupTimer=setTimeout(() => {
+                this.imageCleanupTimer=null;
+                for (const node of this.observedImages) if (!node.isConnected) {
+                    this.imageObserver?.unobserve(node); this.observedImages.delete(node);
+                }
+            },0);
+        } else load();
+    }
+
+    displayCachedImage(image,binding,entry) {
+        if (!this.running || binding.epoch !== this.imageEpoch || this.imageBindings.get(image) !== binding) return;
+        let stored = this.imageURLs.get(binding.url);
+        if (!stored || stored.entry.bytes !== entry.bytes || stored.entry.mime !== entry.mime) {
+            // Other mounted/detached previews can still reference the previous URL.
+            if (stored) (this.retiredImageURLs ??= []).push(stored.url);
+            stored = {entry,url:window.URL.createObjectURL(new window.Blob([entry.bytes],{type:entry.mime}))};
+            this.imageURLs.set(binding.url,stored);
+        }
+        stored.entry=entry;
+        image.src=stored.url;
+        image.removeAttribute('title');
+    }
+
+    refreshCachedImages(root) {
+        if (!this.fileCache || !root) return;
+        for (const image of root.querySelectorAll('img[data-yuiko-image]')) this.setCachedImage(image,image.dataset.yuikoImage);
+    }
+
+    releaseCachedImages() {
+        this.imageEpoch++;
+        if (this.cacheWarmupTimer) clearTimeout(this.cacheWarmupTimer);
+        this.cacheWarmupTimer=null; this.cacheWarmup=null; this.imageFailures.clear();
+        this.imageObserver?.disconnect(); this.imageObserver=null;
+        if (this.imageCleanupTimer) clearTimeout(this.imageCleanupTimer);
+        this.imageCleanupTimer=null; this.observedImages?.clear();
+        for (const entry of this.imageURLs.values()) window.URL.revokeObjectURL?.(entry.url);
+        for (const url of this.retiredImageURLs || []) window.URL.revokeObjectURL?.(url);
+        this.retiredImageURLs=[];
+        this.imageURLs.clear(); this.imageRequests.clear(); this.imageBindings=new WeakMap();
+    }
+
+    createCacheDeleteButton() {
+        const button=document.createElement('button');
+        button.type='button'; button.className='yuiko-cache-delete'; button.textContent='캐시 삭제';
+        button.style.cssText='margin:8px;padding:8px 12px;cursor:pointer';
+        button.addEventListener('click',async () => {
+            button.disabled=true;
+            try { await this.deleteCacheAndReload(); } finally { button.disabled=false; }
+        });
+        return button;
+    }
+
+    getSettingsPanel() {
+        const panel=document.createElement('div');
+        panel.className='yuiko-plugin-settings';
+        panel.style.cssText='display:flex;flex-direction:column;gap:12px;font-size:14px;line-height:1.5';
+        const status=document.createElement('p'); status.setAttribute('role','status');
+        const update=this.contiButton('수동 업데이트',async()=>{
+            const buttons=[...panel.querySelectorAll('button')]; buttons.forEach(button=>button.disabled=true);
+            status.textContent='추가·삭제·수정된 콘을 확인하고 있습니다...';
+            try {
+                const result=await this.manualRefreshCatalog();
+                status.textContent=`업데이트 완료 · 추가 ${result.added}개 · 삭제 ${result.removed}개 · 정보 수정 ${result.metadata}개 · 이미지 갱신 ${result.images}개${result.failed ? ` · 이미지 확인 실패 ${result.failed}개 (기존 캐시 유지)` : ''}`;
+            } catch (error) { status.textContent=`업데이트하지 못했습니다: ${error.message}`; }
+            finally { buttons.forEach(button=>button.disabled=false); }
+        },true);
+        update.classList.add('yuiko-manual-update');
+        const updateHelp=document.createElement('p'); updateHelp.textContent='콘 목록과 이미지의 변경 여부를 확인하고 필요한 항목만 갱신합니다.';
+        const deleteHelp=document.createElement('p'); deleteHelp.textContent='캐시 삭제는 저장된 목록과 이미지를 비우고 다시 받습니다. 즐겨찾기와 콘티는 유지됩니다.';
+        panel.append(updateHelp,update,deleteHelp,this.createCacheDeleteButton(),status);
+        return panel;
+    }
+
+    openPluginSettings() {
+        this.closePluginSettings(); this.closeAutocomplete();
+        const restoreFocus=document.activeElement;
+        const overlay=document.createElement('div'); overlay.className='yuiko-conti-overlay yuiko-settings-overlay';
+        const dialog=document.createElement('div'); dialog.className='yuiko-conti-dialog';
+        dialog.setAttribute('role','dialog'); dialog.setAttribute('aria-modal','true'); dialog.setAttribute('aria-label','Yuiko 설정');
+        const title=document.createElement('h2'); title.textContent='Yuiko 설정';
+        const close=this.contiButton('닫기',()=>this.closePluginSettings());
+        dialog.append(title,this.getSettingsPanel(),close); overlay.append(dialog);
+        overlay.addEventListener('pointerdown',event=>event.stopPropagation());
+        overlay.addEventListener('click',event=>{event.stopPropagation();if (event.target===overlay) this.closePluginSettings();});
+        overlay.addEventListener('keydown',event=>{
+            if (event.key==='Escape') {event.preventDefault();event.stopPropagation();this.closePluginSettings();}
+            if (event.key==='Tab') {
+                const buttons=[...dialog.querySelectorAll('button')].filter(button=>!button.disabled);
+                if (event.shiftKey && document.activeElement===buttons[0]) {event.preventDefault();buttons.at(-1).focus();}
+                else if (!event.shiftKey && document.activeElement===buttons.at(-1)) {event.preventDefault();buttons[0].focus();}
+            }
+        });
+        document.body.append(overlay); this.pluginSettings={overlay,restoreFocus};
+        dialog.querySelector('button').focus();
+    }
+
+    closePluginSettings() {
+        if (!this.pluginSettings) return;
+        const {overlay,restoreFocus}=this.pluginSettings; overlay.remove(); this.pluginSettings=null;
+        if (restoreFocus?.isConnected) restoreFocus.focus();
+    }
+
+    manualRefreshCatalog() {
+        if (this.manualRefreshRequest) return this.manualRefreshRequest;
+        if (!this.running || this.clearingCache) return Promise.reject(new Error('플러그인을 켜고 캐시 작업이 끝난 뒤 다시 시도해 주세요.'));
+        const request=this.refreshCatalogChanges();
+        this.manualRefreshRequest=request;
+        const done=()=>{if(this.manualRefreshRequest===request) this.manualRefreshRequest=null;};
+        request.then(done,done); return request;
+    }
+
+    async refreshCatalogChanges() {
+        const sessionId=this.sessionId;
+        const ensureCurrent=()=>{if(!this.isCurrentSession(sessionId)) throw Error('작업이 취소되었습니다.');};
+        if (this.cacheWarmupTimer) clearTimeout(this.cacheWarmupTimer);
+        this.cacheWarmupTimer=null; this.cacheWarmup=null;
+        await Promise.allSettled([this.latestRequest,this.groupsRequest].filter(Boolean));
+        ensureCurrent();
+        const before=new Map(this.knownItems);
+        const [rawGroups,latest]=await Promise.all([this.fetchApiJson('groups'),this.fetchApiJson('latest')]);
+        ensureCurrent();
+        if (!Array.isArray(rawGroups) || rawGroups.some(group=>!group || !Number.isSafeInteger(Number(group.id)) || Number(group.id)<0 || !Number.isFinite(Number(group.count)) || Number(group.count)<0)) throw Error('올바른 그룹 목록이 아닙니다.');
+        if (!latest || !(typeof latest.datetime==='string' && latest.datetime || typeof latest.datetime==='number' && Number.isFinite(latest.datetime))) throw Error('갱신 시각을 확인하지 못했습니다.');
+        const groups=rawGroups.map(group=>({id:Number(group.id),name:String(group.name || `그룹 ${group.id}`),description:String(group.description || ''),count:Number(group.count)}));
+        const available=new Set(groups.map(group=>group.id));
+        const wanted=new Set([...(this.enabledGroupIds || groups.map(group=>group.id)),...before.values()].map(value=>typeof value==='object' ? value.groupId : value));
+        const targets=groups.filter(group=>wanted.has(group.id));
+        const responses=await Promise.all(targets.map(async group=>{
+            const items=(await this.fetchGroupItems(group.id)).filter(item=>![true,1,'1'].includes(item.removed)).map(item=>({...item,groupName:group.name}));
+            if (!items.length && group.count>0) throw Error(`${group.name} 목록이 비어 있어 기존 캐시를 유지합니다.`);
+            return [group.id,items];
+        }));
+        ensureCurrent();
+        // Commit only after all requested lists have arrived successfully.
+        const after=new Map([...before].filter(([,item])=>available.has(item.groupId)));
+        for (const [id,items] of responses) {
+            for (const [url,item] of after) if (item.groupId===id) after.delete(url);
+            for (const item of items) after.set(item.url,item);
+        }
+        const removed=[...before.keys()].filter(url=>!after.has(url));
+        const result={added:0,removed:removed.length,metadata:0,images:0,failed:0};
+        for (const [url,item] of after) {
+            if (!before.has(url)) result.added++;
+            else if (JSON.stringify(this.slimItem(before.get(url)))!==JSON.stringify(this.slimItem(item))) result.metadata++;
+        }
+        this.cancelApiRequests(); this.releaseCachedImages();
+        this.loadToken++; this.groupsLoadToken++;
+        this.groups=groups; this.applyGroupOrder(); this.knownItems=after;
+        this.enabledGroupIds=(this.enabledGroupIds || groups.map(group=>group.id)).filter(id=>available.has(id));
+        if (!available.has(this.selectedGroupId)) this.selectedGroupId=null;
+        this.groupThumbs={};
+        for (const item of after.values()) if (!this.groupThumbs[item.groupId]) this.groupThumbs[item.groupId]=item.url;
+        this.groupPreviewCache.clear(); this.lastDatetime=latest.datetime; this.lastCheckAt=Date.now();
+        this.items=[...after.values()].filter(item=>this.selectedGroupId===null ? this.enabledGroupIds.includes(item.groupId) : item.groupId===this.selectedGroupId);
+        this.itemByUrl=new Map(this.items.map(item=>[item.url,item]));
+        this.fileCache ??= new YuikoCacheFile(require('fs'),require('path').join(BdApi.Plugins.folder,`${this.pluginName}.cache`));
+        this.fileCache.removeImages(removed); this.saveGroupSettings(); this.saveCache();
+        if (this.cacheWriteErrorShown) throw Error('캐시 파일에 저장하지 못했습니다. 디스크 공간과 폴더 권한을 확인해 주세요.');
+        this.gridItemNodes.clear(); this.gridRenderKey=this.groupControlsKey=null;
+        if (this.panel) {this.renderGroupControls();this.render(this.searchInput?.value || '');}
+        const urls=[...after.keys()].filter(url=>this.enabledGroupIds.includes(after.get(url).groupId) || this.fileCache.images.has(url));
+        let index=0;
+        await Promise.all(Array.from({length:4},async()=>{
+            while(index<urls.length) {
+                ensureCurrent();
+                if (Date.now()<this.apiState.cooldownUntil) {result.failed+=urls.length-index;index=urls.length;return;}
+                const url=urls[index++], old=this.fileCache.getImage(url);
+                try {
+                    const entry=await this.requestCachedImage(url,true); ensureCurrent();
+                    if (entry && entry.bytes!==old?.bytes) result.images++;
+                } catch (error) {ensureCurrent();result.failed++;}
+            }
+        }));
+        ensureCurrent(); this.clearStatusError(); this.refreshCachedImages(this.panel);
+        return result;
+    }
+
+    async deleteCacheAndReload() {
+        if (this.manualRefreshRequest) {BdApi.UI.showToast('업데이트가 끝난 뒤 캐시를 삭제해 주세요.',{type:'info'});return;}
+        if (this.clearingCache) return;
+        this.clearingCache=true;
+        const sessionId=++this.sessionId;
+        this.updateInFlight=false;
+        if (this.updateTimer) clearTimeout(this.updateTimer);
+        this.updateTimer=null;
+        this.scheduleHourlyUpdateCheck();
+        this.loadToken++; this.groupsLoadToken++;
+        this.cancelApiRequests(); this.groupsRequest=this.latestRequest=null;
+        this.closeAutocomplete(); this.releaseCachedImages();
+        try {
+            this.fileCache ??= new YuikoCacheFile(require('fs'),require('path').join(BdApi.Plugins.folder,`${this.pluginName}.cache`),true);
+            this.fileCache.clear();
+            BdApi.Data.delete(this.pluginName,'cache'); BdApi.Data.delete(this.pluginName,'groupThumbs');
+            this.groups=[]; this.groupThumbs={}; this.items=[]; this.knownItems.clear(); this.itemByUrl.clear();
+            this.groupPreviewCache.clear(); this.gridItemNodes.clear();
+            this.gridRenderKey=this.groupControlsKey=null; this.lastDatetime=null; this.lastCheckAt=0;
+            this.cacheWriteErrorShown=false;
+            if (this.panel) { this.renderGroupControls(); this.render(); }
+            this.clearStatusError();
+            this.clearingCache=false;
+            if (!this.running) {
+                BdApi.UI.showToast('캐시를 삭제했습니다. 플러그인을 켜면 목록을 다시 받습니다.',{type:'success'});
+                return;
+            }
+            await this.checkForUpdates(true);
+            if (this.isCurrentSession(sessionId)) BdApi.UI.showToast(this.groups.length ? '캐시를 삭제하고 목록을 다시 받았습니다.' : '캐시를 삭제했습니다. 서버 연결 후 다시 받을 수 있습니다.',{type:this.groups.length ? 'success' : 'info'});
+        } catch (error) {
+            console.warn('[YuikoStickers] 캐시 삭제 실패:',error);
+            if (this.sessionId===sessionId) BdApi.UI.showToast('캐시를 삭제하지 못했습니다. 폴더 권한을 확인해 주세요.',{type:'error'});
+        } finally { this.clearingCache=false; }
+    }
 
     createPanel() {
         if (this.panel) return;
@@ -1294,9 +1693,11 @@ module.exports = class YuikoStickers {
         panel.style.display = 'none';
         const header = document.createElement('div'); header.className = 'yuiko-header';
         const title = document.createElement('div'); title.className = 'yuiko-title'; title.textContent = 'Yuiko';
-        const manage = document.createElement('button'); manage.className = 'yuiko-manage-toggle'; manage.type = 'button'; manage.textContent = '⚙'; manage.title = '그룹 표시 설정';
+        const manage = document.createElement('button'); manage.className = 'yuiko-manage-toggle'; manage.type = 'button'; manage.textContent = '☷'; manage.title = '그룹 표시 설정';
+        const settings=document.createElement('button'); settings.className='yuiko-manage-toggle yuiko-settings-toggle'; settings.type='button'; settings.textContent='⚙'; settings.title='Yuiko 설정';
+        settings.addEventListener('click',event=>{event.stopPropagation();this.openPluginSettings();});
         const search = document.createElement('input'); search.className = 'yuiko-search'; search.type = 'search'; search.placeholder = '이모지 검색...';
-        header.append(title, manage, search);
+        header.append(title, manage, search,settings);
         const groupbar = document.createElement('div'); groupbar.className = 'yuiko-groupbar';
         const managePanel = document.createElement('div'); managePanel.className = 'yuiko-manage';
         const grid = document.createElement('div'); grid.className = 'yuiko-grid';
@@ -1385,7 +1786,7 @@ module.exports = class YuikoStickers {
         if (!this.isCurrentSession(sessionId) || this.groupPreview !== popup || this.groupPreviewId !== id || !row.isConnected) return;
         grid.replaceChildren();
         if (!items.length) { const empty = document.createElement('div'); empty.className = 'yuiko-group-preview-empty'; empty.textContent = '이모지를 불러오지 못했습니다.'; grid.appendChild(empty); }
-        for (const item of items) { const image = document.createElement('img'); image.src = item.url; image.alt = item.name; grid.appendChild(image); }
+        for (const item of items) { const image = document.createElement('img'); this.setCachedImage(image,item.url); image.alt = item.name; grid.appendChild(image); }
         this.positionGroupPreview(row);
     }
     positionGroupPreview(row) {
@@ -1484,7 +1885,7 @@ module.exports = class YuikoStickers {
         this.queuedItems.forEach((item, index) => {
             const name = this.getCallword(item);
             const card = document.createElement('div'); card.className = 'yuiko-queue-item'; card.setAttribute('role', 'listitem'); card.title = `${index + 1}. ${name}`;
-            const image = document.createElement('img'); image.src = item.url; image.alt = name; image.draggable = false;
+            const image = document.createElement('img'); this.setCachedImage(image,item.url); image.alt = name; image.draggable = false;
             const number = document.createElement('span'); number.className = 'yuiko-queue-number'; number.textContent = String(index + 1);
             const remove = document.createElement('button'); remove.className = 'yuiko-queue-remove'; remove.type = 'button'; remove.textContent = '×';
             remove.title = `${index + 1}번 ${name} 선택 취소`; remove.setAttribute('aria-label', remove.title);
@@ -1499,7 +1900,7 @@ module.exports = class YuikoStickers {
     showPreview(item, event) {
         if (!this.previewImage || !this.preview) return;
         // 같은 이미지 위의 mousemove마다 src를 다시 쓰지 않는다 (GIF 재시작/불필요한 DOM 변경 방지).
-        if (this.previewImage.getAttribute('src') !== item.url) this.previewImage.src = item.url;
+        if (this.previewImage.dataset.yuikoImage !== item.url) this.setCachedImage(this.previewImage,item.url);
         this.preview.classList.add('is-visible');
         let left = event.clientX + 18, top = event.clientY + 18;
         const width = this.preview.offsetWidth || 200, height = this.preview.offsetHeight || 220;
@@ -1514,6 +1915,8 @@ module.exports = class YuikoStickers {
         if (this.panel.style.display === 'flex') return this.closePanel();
         if (!this.composer?.isConnected) return BdApi.UI.showToast('Discord 메시지 입력창을 찾을 수 없습니다.', {type:'error'});
         this.saveComposerSelection(); this.panel.style.display = 'flex';
+        this.refreshCachedImages(this.panel);
+        this.scheduleCacheWarmup();
         // 정시를 기다리지 않고 패널을 열 때도 확인하되 GitHub 요청은 5분 간격으로 제한한다.
         if (Date.now() - this.lastPluginUpdateCheck >= 5 * 60 * 1000) this.checkPluginUpdate();
         const rect = button.getBoundingClientRect(), panelRect = this.panel.getBoundingClientRect(), margin = 10;
@@ -1601,7 +2004,7 @@ module.exports = class YuikoStickers {
     /**
      * 이모지 칸 (포인터 드래그 정렬을 위해 <button> 대신 <div>)
      */
-    createItem(item, section = null) { const button = document.createElement('div'); button.className = 'yuiko-item'+(this.favorites.has(item.url) ? ' is-favorite' : ''); button.setAttribute('role', 'button'); button.tabIndex = 0; button.dataset.url = item.url; if (section) button.dataset.section = section; const image = document.createElement('img'); image.src = item.url; image.alt = item.name; image.loading = 'lazy'; image.draggable = false; button.appendChild(image); return button; }
+    createItem(item, section = null) { const button = document.createElement('div'); button.className = 'yuiko-item'+(this.favorites.has(item.url) ? ' is-favorite' : ''); button.setAttribute('role', 'button'); button.tabIndex = 0; button.dataset.url = item.url; if (section) button.dataset.section = section; const image = document.createElement('img'); this.setCachedImage(image,item.url); image.alt = item.name; image.loading = 'lazy'; image.draggable = false; button.appendChild(image); return button; }
 
     useEmoji(item) {
         const composer = this.composer;
@@ -1802,3 +2205,234 @@ module.exports = class YuikoStickers {
         this.saveCache();
     }
 };
+
+// Append-only binary records: magic, metadata length, payload length, metadata CRC,
+// JSON metadata, then raw bytes. A damaged record cannot invalidate the others.
+class YuikoCacheFile {
+    static limit = 500 * 1024 * 1024;
+    static maxImageBytes = 20 * 1024 * 1024;
+    static magic = new Uint8Array([89,75,67,49]); // YKC1
+    static crcTable = Array.from({length:256},(_,n) => {
+        for (let i=0;i<8;i++) n=(n & 1) ? 0xedb88320 ^ (n >>> 1) : n >>> 1;
+        return n >>> 0;
+    });
+    static crc(bytes) {
+        let n=0xffffffff;
+        for (const byte of bytes) n=this.crcTable[(n ^ byte) & 255] ^ (n >>> 8);
+        return (n ^ 0xffffffff) >>> 0;
+    }
+    static imageType(b) {
+        if (b.length<12) return null;
+        if ([137,80,78,71,13,10,26,10].every((v,i)=>b[i]===v)) return 'image/png';
+        const ascii=(start,end)=>String.fromCharCode(...b.subarray(start,end));
+        if (['GIF87a','GIF89a'].includes(ascii(0,6))) return 'image/gif';
+        if (b[0]===255 && b[1]===216 && b[2]===255) return 'image/jpeg';
+        if (ascii(0,4)==='RIFF' && ascii(8,12)==='WEBP') return 'image/webp';
+        return null;
+    }
+
+    constructor(fs,path,skipRead=false) {
+        this.fs=fs; this.path=path; this.temp=path+'.tmp';
+        this.images=new Map(); this.catalog=null; this.catalogText=null;
+        this.size=0; this.liveBytes=0; this.damaged=false;
+        this.compaction=null; this.compactionTimer=null; this.compactionEpoch=0;
+        this.encoder=new TextEncoder(); this.decoder=new TextDecoder();
+        if (!skipRead) this.read();
+    }
+
+    read() {
+        if (!this.fs.existsSync(this.path)) return;
+        const size=this.fs.statSync(this.path).size;
+        if (size>YuikoCacheFile.limit+32*1024*1024) throw new Error('캐시 파일이 최대 크기를 초과했습니다.');
+        // BetterDiscord's fs shim has no open/read or streams for partial reads.
+        const raw=this.fs.readFileSync(this.path,{encoding:null});
+        const data=new Uint8Array(raw.buffer,raw.byteOffset,raw.byteLength);
+        this.size=data.length;
+        let offset=0;
+        while (offset+16<=data.length) {
+            const start=offset;
+            if (!YuikoCacheFile.magic.every((v,i)=>data[offset+i]===v)) {
+                this.damaged=true;
+                const next=data.indexOf(89,offset+1);
+                offset=next<0 ? data.length : next;
+                continue;
+            }
+            const view=new DataView(data.buffer,data.byteOffset+offset,16);
+            const headerSize=view.getUint32(4,true), bodySize=view.getUint32(8,true);
+            const end=offset+16+headerSize+bodySize;
+            if (!headerSize || headerSize>8192 || bodySize>YuikoCacheFile.maxImageBytes || end>data.length) { this.damaged=true; offset++; continue; }
+            const header=data.subarray(offset+16,offset+16+headerSize);
+            if (YuikoCacheFile.crc(header)!==view.getUint32(12,true)) { this.damaged=true; offset++; continue; }
+            offset=end;
+            try {
+                const meta=JSON.parse(this.decoder.decode(header));
+                const bytes=data.subarray(start+16+headerSize,end);
+                if (meta.type==='catalog') {
+                    if (YuikoCacheFile.crc(bytes)!==meta.crc) throw Error('목록 체크섬 오류');
+                    const text=this.decoder.decode(bytes), catalog=JSON.parse(text);
+                    if (!catalog || !Array.isArray(catalog.known) || !Array.isArray(catalog.groups) || !Array.isArray(catalog.shown)) throw Error('목록 형식 오류');
+                    this.catalog=catalog; this.catalogText=text;
+                } else if (meta.type==='image' && typeof meta.url==='string' && /^https?:\/\//i.test(meta.url) && typeof meta.crc==='number') {
+                    this.images.delete(meta.url);
+                    this.images.set(meta.url,{...meta,bytes,recordSize:end-start,verified:false});
+                } else if (meta.type==='validation') {
+                    const image=this.images.get(meta.url);
+                    if (image && image.crc===meta.imageCrc) Object.assign(image,{revision:meta.revision,etag:meta.etag,lastModified:meta.lastModified});
+                } else if (meta.type==='delete') {
+                    if (YuikoCacheFile.crc(bytes)!==meta.crc) throw Error('삭제 레코드 체크섬 오류');
+                    const urls=JSON.parse(this.decoder.decode(bytes));
+                    if (!Array.isArray(urls) || urls.some(url=>typeof url!=='string')) throw Error('삭제 레코드 형식 오류');
+                    for (const url of urls) this.images.delete(url);
+                } else throw Error('알 수 없는 레코드');
+            } catch { this.damaged=true; }
+        }
+        if (offset!==data.length) this.damaged=true;
+        this.liveBytes=[...this.images.values()].reduce((sum,item)=>sum+item.recordSize,0);
+    }
+
+    record(meta,bytes,crc=YuikoCacheFile.crc(bytes)) {
+        const header=this.encoder.encode(JSON.stringify({...meta,crc}));
+        if (header.length>8192 || bytes.length>YuikoCacheFile.maxImageBytes) throw Error('캐시 항목이 너무 큽니다.');
+        const record=new Uint8Array(16+header.length+bytes.length);
+        record.set(YuikoCacheFile.magic);
+        const view=new DataView(record.buffer);
+        view.setUint32(4,header.length,true); view.setUint32(8,bytes.length,true); view.setUint32(12,YuikoCacheFile.crc(header),true);
+        record.set(header,16); record.set(bytes,16+header.length);
+        return record;
+    }
+
+    append(record) {
+        if (this.size+record.length>YuikoCacheFile.limit+24*1024*1024) {
+            this.scheduleCompaction(); throw Error('캐시 용량 한도에 도달했습니다.');
+        }
+        try {
+            this.fs.writeFileSync(this.path,record,{flag:'a'});
+            this.size+=record.length;
+            if (this.compaction) this.compaction.pending.push(record);
+        } catch (error) {
+            this.damaged=true;
+            this.size=this.fs.existsSync(this.path) ? this.fs.statSync(this.path).size : 0;
+            throw error;
+        }
+        if (this.damaged || this.size-this.liveBytes>8*1024*1024) this.scheduleCompaction();
+    }
+
+    saveCatalog(catalog) {
+        const text=JSON.stringify(catalog);
+        if (text===this.catalogText) return;
+        this.append(this.record({type:'catalog'},this.encoder.encode(text)));
+        this.catalog=JSON.parse(text); this.catalogText=text;
+    }
+
+    getImage(url) {
+        const entry=this.images.get(url);
+        if (!entry) return null;
+        if (!entry.verified) {
+            if (YuikoCacheFile.crc(entry.bytes)!==entry.crc || YuikoCacheFile.imageType(entry.bytes)!==entry.mime) {
+                this.images.delete(url); this.liveBytes-=entry.recordSize; this.damaged=true;
+                this.scheduleCompaction(); return null;
+            }
+            entry.verified=true;
+        }
+        this.images.delete(url); this.images.set(url,entry);
+        return entry;
+    }
+
+    putImage(url,entry) {
+        const old=this.images.get(url);
+        const crc=YuikoCacheFile.crc(entry.bytes);
+        if (old && old.crc===crc && old.bytes.length===entry.bytes.length && old.verified) return this.validateImage(url,old,entry);
+        const record=this.record({type:'image',url,mime:entry.mime,revision:entry.revision,etag:entry.etag,lastModified:entry.lastModified},entry.bytes,crc);
+        if (this.size+record.length>YuikoCacheFile.limit) { this.scheduleCompaction(true); return entry; }
+        this.append(record);
+        const stored={...entry,crc,recordSize:record.length,verified:true};
+        this.images.delete(url); this.images.set(url,stored);
+        this.liveBytes+=record.length-(old?.recordSize || 0);
+        return stored;
+    }
+
+    validateImage(url,entry,updates) {
+        const current=this.images.get(url);
+        if (current!==entry) return current || entry;
+        const metadata={revision:updates.revision,etag:updates.etag || null,lastModified:updates.lastModified || null};
+        if (Object.keys(metadata).every(key=>(current[key] ?? null)===(metadata[key] ?? null))) return current;
+        this.append(this.record({type:'validation',url,imageCrc:entry.crc,...metadata},new Uint8Array()));
+        const stored={...current,...metadata}; this.images.set(url,stored); return stored;
+    }
+
+    removeImages(urls) {
+        const removed=[...new Set(urls)].filter(url=>this.images.has(url));
+        if (!removed.length) return;
+        this.append(this.record({type:'delete'},this.encoder.encode(JSON.stringify(removed))));
+        for (const url of removed) { this.liveBytes-=this.images.get(url).recordSize; this.images.delete(url); }
+        this.scheduleCompaction();
+    }
+
+    scheduleCompaction(evict=false) {
+        this.evict ||= evict;
+        if (this.compaction || this.compactionTimer) return;
+        this.compactionTimer=setTimeout(() => {
+            this.compactionTimer=null;
+            this.compact().catch(error=>console.warn('[YuikoStickers] 캐시 정리 실패:',error));
+        },1000);
+    }
+
+    async compact() {
+        if (this.compaction) return;
+        const run={epoch:this.compactionEpoch,pending:[]};
+        this.compaction=run;
+        try {
+            // Preserve the original until the entire replacement has been written.
+            this.fs.writeFileSync(this.temp,new Uint8Array());
+            const snapshot=new Map(this.images);
+            let entries=[...snapshot];
+            if (this.evict) {
+                let retained=0;
+                entries=entries.reverse().filter(([,entry]) => (retained+=entry.recordSize)<=YuikoCacheFile.limit*0.8).reverse();
+            }
+            this.evict=false;
+            const retainedURLs=new Set(entries.map(([url])=>url));
+            let total=0;
+            for (const [url,entry] of entries) {
+                if (run.epoch!==this.compactionEpoch) return;
+                if (YuikoCacheFile.crc(entry.bytes)!==entry.crc || YuikoCacheFile.imageType(entry.bytes)!==entry.mime) { retainedURLs.delete(url); continue; }
+                const record=this.record({type:'image',url,mime:entry.mime,revision:entry.revision,etag:entry.etag,lastModified:entry.lastModified},entry.bytes);
+                this.fs.writeFileSync(this.temp,record,{flag:'a'}); total+=record.length;
+                await new Promise(resolve=>setTimeout(resolve,0));
+            }
+            if (run.epoch!==this.compactionEpoch) return;
+            if (this.catalogText) {
+                const record=this.record({type:'catalog'},this.encoder.encode(this.catalogText));
+                this.fs.writeFileSync(this.temp,record,{flag:'a'}); total+=record.length;
+            }
+            for (const record of run.pending) { this.fs.writeFileSync(this.temp,record,{flag:'a'}); total+=record.length; }
+            this.fs.renameSync(this.temp,this.path);
+            // Entries added while rewriting are already included in pending records.
+            for (const [url,entry] of snapshot) if (!retainedURLs.has(url) && this.images.get(url)===entry) this.images.delete(url);
+            this.size=total; this.damaged=false;
+            this.liveBytes=[...this.images.values()].reduce((sum,item)=>sum+item.recordSize,0);
+        } finally {
+            if (this.compaction===run) {
+                this.compaction=null;
+                if (this.fs.existsSync(this.temp)) this.fs.unlinkSync(this.temp);
+            }
+        }
+    }
+
+    cancelCompaction() {
+        this.compactionEpoch++;
+        if (this.compactionTimer) clearTimeout(this.compactionTimer);
+        this.compactionTimer=null;
+        this.compaction=null;
+        try { if (this.fs.existsSync(this.temp)) this.fs.unlinkSync(this.temp); }
+        catch (error) { console.warn('[YuikoStickers] 임시 캐시 정리 실패:',error); }
+    }
+
+    clear() {
+        this.cancelCompaction();
+        this.fs.writeFileSync(this.temp,new Uint8Array());
+        this.fs.renameSync(this.temp,this.path);
+        this.images.clear(); this.catalog=null; this.catalogText=null;
+        this.size=this.liveBytes=0; this.damaged=false;
+    }
+}
