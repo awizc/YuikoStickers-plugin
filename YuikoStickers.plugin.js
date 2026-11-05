@@ -2,7 +2,7 @@
  * @name YuikoStickers
  * @author ChatGPT
  * @description Snow Family Yuiko 이모지를 그룹별로 선택해 Discord에 입력합니다.
- * @version 2.18.6
+ * @version 2.18.10
  * @source https://github.com/awizc/YuikoStickers-plugin
  * @updateUrl https://raw.githubusercontent.com/awizc/YuikoStickers-plugin/main/YuikoStickers.plugin.js
  */
@@ -56,7 +56,10 @@ module.exports = class YuikoStickers {
         this.loadToken = 0;
         this.lastDatetime = null;
         this.lastCheckAt = 0;
-        this.checkInterval = 60 * 1000;
+        this.checkInterval = 5 * 60 * 1000;
+        this.apiState = this.createApiState();
+        this.groupsRequest = null;
+        this.latestRequest = null;
 
         this.favorites = new Set();
         this.recent = [];
@@ -67,6 +70,10 @@ module.exports = class YuikoStickers {
         this.button = null;
         this.grid = null;
         this.status = null;
+        this.statusError = null;
+        this.gridRenderKey = null;
+        this.groupControlsKey = null;
+        this.gridItemNodes = new Map();
         this.searchInput = null;
         this.preview = null;
         this.previewImage = null;
@@ -101,7 +108,7 @@ module.exports = class YuikoStickers {
         this.loadGroupThumbs();
         this.loadCache();
         this.loadContis();
-        this.loadGroups(true);
+        this.checkForUpdates(true);
         this.observeDiscord();
         this.bindAutocomplete();
     }
@@ -116,6 +123,8 @@ module.exports = class YuikoStickers {
         this.sessionId++;
         this.loadToken++;
         this.groupsLoadToken++;
+        this.cancelApiRequests();
+        this.groupsRequest = this.latestRequest = null;
         this.updateInFlight = false;
         this.cancelLongPress();
         for (const timer of this.pendingSendTimers) clearTimeout(timer);
@@ -139,6 +148,8 @@ module.exports = class YuikoStickers {
         this.panel = this.button = this.preview = this.groupPreview = null;
         this.previewImage = null;
         this.grid = this.status = this.searchInput = this.composer = this.savedSelection = null;
+        this.statusError = this.gridRenderKey = this.groupControlsKey = null;
+        this.gridItemNodes.clear();
         this.unbindOutsideClick();
         BdApi.DOM.removeStyle(this.pluginName);
     }
@@ -539,7 +550,7 @@ module.exports = class YuikoStickers {
         if (!items.length) return;
         const tray = document.createElement('div'); tray.className='yuiko-draft-tray';
         const heading=document.createElement('div'); heading.className='yuiko-conti-heading';
-        const title=document.createElement('strong'); title.textContent=`보낼 콘 ${items.length}개`; heading.append(title);
+        const title=document.createElement('strong'); title.textContent=`보낼 콘 ${items.length}개 · Enter로 모은 콘만 전송`; heading.append(title);
         if (items.length >= 2) heading.append(this.contiButton('🎬 콘티 저장',() => this.openContiEditor(items),true));
         const strip=this.createContiStrip(items,next => {
             const current=this.getAutocompleteContext();
@@ -559,6 +570,7 @@ module.exports = class YuikoStickers {
         this.autocompleteEnterHeld = null;
         this.autocompleteTabHeld = null;
         this.autocompleteDismissed = null;
+        this.autocompleteDraft = null;
         this.syntheticSendEvents = new WeakSet();
         const input = () => { this.autocompleteDismissed = null; refresh(); };
         const close = () => this.closeAutocomplete();
@@ -581,15 +593,19 @@ module.exports = class YuikoStickers {
                 event.preventDefault(); event.stopImmediatePropagation(); return;
             }
             if (!this.autocomplete || !this.autocompleteContext?.composer.contains(event.target) || this.autocompleteComposing || event.isComposing || event.keyCode === 229) return;
-            if (!this.autocompleteItems.length && event.key !== 'Escape') return;
+            if (!this.autocompleteItems.length && !['Enter', 'Escape'].includes(event.key)) return;
             if (!['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(event.key) || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+            if (!this.autocompleteEdit) {
+                const context = this.getAutocompleteContext();
+                if (!context || context.composer !== this.autocompleteContext.composer || context.key !== this.autocompleteContext.key) return close();
+            }
             event.preventDefault(); event.stopImmediatePropagation();
             if (event.key === 'Escape') { this.autocompleteDismissed = this.autocompleteContext?.key; close(); return; }
             if (event.key === 'Enter' || event.key === 'Tab') {
                 if (event.repeat) return;
                 if (event.key === 'Enter') this.autocompleteEnterHeld = this.autocompleteContext?.composer;
                 if (event.key === 'Tab') this.autocompleteTabHeld = this.autocompleteContext?.composer;
-                return this.acceptAutocomplete(event.key === 'Tab');
+                return event.key === 'Enter' ? this.submitAutocomplete() : this.acceptAutocomplete(true);
             }
             const count = this.autocompleteItems.length;
             this.autocompleteIndex = (this.autocompleteIndex + (event.key === 'ArrowDown' ? 1 : -1) + count) % count;
@@ -597,10 +613,10 @@ module.exports = class YuikoStickers {
         };
         const listeners = [[document,'input',input], [document,'selectionchange',refresh], [document,'compositionstart',compositionStart], [document,'compositionupdate',input], [document,'compositionend',compositionEnd], [document,'keydown',keydown], [document,'keyup',keyup], [document,'mousedown',outside], [document,'scroll',scroll], [window,'resize',close], [window,'blur',blur]];
         for (const [target, type, handler] of listeners) target.addEventListener(type, handler, true);
-        this.unbindAutocomplete = () => { this.autocompleteEnterHeld = this.autocompleteTabHeld = null; for (const [target, type, handler] of listeners) target.removeEventListener(type, handler, true); };
+        this.unbindAutocomplete = () => { this.autocompleteEnterHeld = this.autocompleteTabHeld = this.autocompleteDraft = null; for (const [target, type, handler] of listeners) target.removeEventListener(type, handler, true); };
     }
 
-    getAutocompleteContext() {
+    getComposerContext() {
         const selection = window.getSelection();
         if (!selection?.rangeCount || !selection.isCollapsed) return null;
         const caret = selection.getRangeAt(0);
@@ -611,13 +627,19 @@ module.exports = class YuikoStickers {
         const after = caret.cloneRange(); after.selectNodeContents(composer); after.setStart(caret.endContainer,caret.endOffset);
         if (after.toString()) return null;
         const before = caret.cloneRange(); before.selectNodeContents(composer); before.setEnd(caret.endContainer, caret.endOffset);
-        const text = before.toString();
+        return {composer, range:caret.cloneRange(), key:before.toString()};
+    }
+
+    getAutocompleteContext() {
+        const context = this.getComposerContext();
+        if (!context) return null;
+        const {composer, range, key:text} = context;
         if (!text.startsWith(this.commandPrefix) || /[\r\n\t\u2028\u2029]/u.test(text)) return null;
-        // Adjacent sticker commands also allow completing the last dot token.
         const start = text.lastIndexOf(this.commandPrefix);
-        if (start < 0) return null;
+        // Only a prefix inserted by Tab/tray selection may precede another query.
+        // Typed dots (including ".." and ".....") stay ordinary chat text.
+        if (start > 0 && (this.autocompleteDraft?.composer !== composer || this.autocompleteDraft.prefix !== text.slice(0,start))) return null;
         const query = text.slice(start + 1);
-        const range = caret.cloneRange();
         const walker = document.createTreeWalker(composer, 4);
         let offset = 0, node;
         while ((node = walker.nextNode())) {
@@ -658,21 +680,26 @@ module.exports = class YuikoStickers {
 
     refreshAutocomplete() {
         if (!this.running || this.contiEditor) return;
-        const context = this.getAutocompleteContext();
+        const composerContext = this.getComposerContext();
         if (this.autocompleteEdit) {
             const edit = this.autocompleteEdit;
             if (!edit.composer.isConnected || document.activeElement !== edit.composer) return this.closeAutocomplete();
-            if (context?.composer !== edit.composer || context.key !== edit.expectedKey) return;
+            if (composerContext?.composer !== edit.composer || composerContext.key !== edit.expectedKey) return;
             clearTimeout(this.autocompleteEditTimer); this.autocompleteEditTimer = null;
             this.autocompleteEdit = null;
             if (edit.send) {
-                this.autocompleteDismissed = context.key;
+                this.autocompleteDraft = null;
+                this.autocompleteDismissed = composerContext.key;
                 this.closeAutocomplete();
                 if (edit.items?.length) this.addRecentItems(edit.items);
-                this.sendMessage(edit.composer, context.key);
+                this.sendMessage(edit.composer, composerContext.key);
                 return;
             }
+            const prefix = edit.expectedKey.slice(0,edit.expectedKey.lastIndexOf(this.commandPrefix));
+            this.autocompleteDraft = prefix ? {composer:edit.composer, prefix} : null;
         }
+        const context = this.getAutocompleteContext();
+        if (composerContext && (!context || context.key.lastIndexOf(this.commandPrefix) === 0)) this.autocompleteDraft = null;
         if (!context || context.key === this.autocompleteDismissed) return this.closeAutocomplete();
         const query = context.query.toLowerCase();
         const items = [...this.knownItems.values()].filter(item => this.enabledGroupIds?.includes(item.groupId) && this.matchesAutocomplete(this.getSearchText(item), query));
@@ -708,7 +735,7 @@ module.exports = class YuikoStickers {
         panel.style.width = `${Math.max(0, Math.min(Math.max(240, rect.width), innerWidth - 16))}px`;
         panel.style.bottom = `${Math.max(8, innerHeight - rect.top + 8)}px`;
         panel.style.maxHeight = `${Math.max(0, Math.min(360, rect.top - 16))}px`;
-        const heading = document.createElement('div'); heading.textContent = `Yuiko 호출어 · ${items.length}개${items.length > 100 ? ' (상위 100개)' : ''} · ↑↓ 이동 · Tab 연속 선택 · Enter/클릭 전송`; heading.style.cssText = 'padding:6px 8px;font-size:12px;color:var(--text-muted,#aaa)'; panel.append(heading);
+        const heading = document.createElement('div'); heading.textContent = `Yuiko 호출어 · ${items.length}개${items.length > 100 ? ' (상위 100개)' : ''} · ↑↓ 이동 · Tab 추가 · Enter 전송`; heading.style.cssText = 'padding:6px 8px;font-size:12px;color:var(--text-muted,#aaa)'; panel.append(heading);
         this.autocompleteItems.forEach((item, index) => {
             const row = document.createElement('div'); row.setAttribute('role','option');
             row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:8px;border-radius:4px;cursor:pointer;';
@@ -735,6 +762,18 @@ module.exports = class YuikoStickers {
             row.setAttribute('aria-selected', String(selected)); row.style.background = selected ? 'var(--background-modifier-selected,#404249)' : '';
             if (selected && scroll) row.scrollIntoView?.({block:'nearest'});
         });
+    }
+
+    submitAutocomplete() {
+        if (this.autocompleteComposing || this.autocompleteEdit) return;
+        const context = this.getAutocompleteContext();
+        if (!context || context.composer !== this.autocompleteContext?.composer || context.key !== this.autocompleteContext?.key) return this.closeAutocomplete();
+        const items = this.getDraftItems(context);
+        if (!items?.length) return this.acceptAutocomplete();
+        // Enter commits only the Tab-selected prefix, discarding the trailing query.
+        const command = context.key.slice(0,-(context.query.length+1));
+        const range = context.range.cloneRange(); range.selectNodeContents(context.composer);
+        this.replaceAutocomplete(context,range,command,command,true,items);
     }
 
     acceptAutocomplete(keepSearch = false) {
@@ -899,25 +938,105 @@ module.exports = class YuikoStickers {
         }
     }
 
-    fetchWithVersion(url) {
+    fetchWithVersion(url, signal) {
         const target = new URL(url);
         target.searchParams.set('v', this.version);
-        return BdApi.Net.fetch(target.href, {headers:{'X-Plugin-Version':this.version}});
+        return BdApi.Net.fetch(target.href, {headers:{'X-Plugin-Version':this.version}, timeout:15000, signal});
     }
 
-    async loadGroups(force = false) {
+    createApiState() {
+        return {pending:new Map(), queue:[], active:0, failures:0, cooldownUntil:0, lastError:''};
+    }
+
+    cancelApiRequests() {
+        const state = this.apiState;
+        this.apiState = {...this.createApiState(), failures:state.failures, cooldownUntil:state.cooldownUntil, lastError:state.lastError};
+        for (const job of state.pending.values()) {
+            job.controller?.abort();
+            job.reject(new Error('플러그인이 종료되어 요청을 취소했습니다.'));
+        }
+        state.pending.clear(); state.queue.length = 0;
+    }
+
+    apiCooldownError(state) {
+        const seconds = Math.max(1,Math.ceil((state.cooldownUntil-Date.now())/1000));
+        return new Error(`${state.lastError || '서버 연결 실패'} · ${seconds}초 뒤 다시 시도할 수 있습니다. 저장된 목록은 계속 사용할 수 있습니다.`);
+    }
+
+    fetchApiJson(endpoint) {
+        const state = this.apiState;
+        if (!this.running) return Promise.reject(new Error('플러그인이 종료되었습니다.'));
+        if (state.pending.has(endpoint)) return state.pending.get(endpoint).promise;
+        if (Date.now() < state.cooldownUntil) return Promise.reject(this.apiCooldownError(state));
+        const job = {endpoint};
+        job.promise = new Promise((resolve,reject) => { job.resolve=resolve; job.reject=reject; });
+        state.pending.set(endpoint,job); state.queue.push(job);
+        this.drainApiQueue(state);
+        return job.promise;
+    }
+
+    drainApiQueue(state) {
+        if (state !== this.apiState || !this.running) return;
+        if (Date.now() < state.cooldownUntil) {
+            for (const job of state.queue.splice(0)) { state.pending.delete(job.endpoint); job.reject(this.apiCooldownError(state)); }
+            return;
+        }
+        // Lists, thumbnails and previews share the same two request slots.
+        while (state.active < 2 && state.queue.length) this.runApiRequest(state,state.queue.shift());
+    }
+
+    async runApiRequest(state, job) {
+        state.active++;
+        const failuresAtStart = state.failures;
+        job.controller = new window.AbortController();
+        try {
+            const response = await this.fetchWithVersion(this.apiBase+job.endpoint,job.controller.signal);
+            if (state !== this.apiState || !this.running) return;
+            if (!response.ok) {
+                const error = new Error(`HTTP ${response.status}`);
+                const retryAfter = response.headers?.get?.('Retry-After');
+                const delay = retryAfter == null ? 0 : /^\d+(\.\d+)?$/.test(retryAfter) ? Number(retryAfter)*1000 : Date.parse(retryAfter)-Date.now();
+                error.retryAfter = Number.isFinite(delay) ? Math.max(0,delay) : 0;
+                throw error;
+            }
+            const data = await response.json();
+            if (state !== this.apiState || !this.running) return;
+            // A success already in flight must not undo another request's cooldown.
+            if (state.failures === failuresAtStart && Date.now() >= state.cooldownUntil) { state.failures=0; state.cooldownUntil=0; }
+            job.resolve(data);
+        } catch (error) {
+            if (state !== this.apiState || !this.running) return;
+            const delay = Math.max(Math.min(300000,30000*2**Math.min(state.failures++,4)),error.retryAfter || 0);
+            state.cooldownUntil = Math.max(state.cooldownUntil,Date.now()+delay);
+            state.lastError = error.message;
+            job.reject(this.apiCooldownError(state));
+        } finally {
+            state.active--;
+            if (state.pending.get(job.endpoint) === job) state.pending.delete(job.endpoint);
+            this.drainApiQueue(state);
+        }
+    }
+
+    loadGroups(force = false) {
+        if (this.groupsRequest) return this.groupsRequest;
+        const request = this.loadGroupsFromServer(force);
+        this.groupsRequest = request;
+        const clear = () => { if (this.groupsRequest === request) this.groupsRequest = null; };
+        request.then(clear,clear);
+        return request;
+    }
+
+    async loadGroupsFromServer(force = false) {
         const sessionId = this.sessionId;
         const token = ++this.groupsLoadToken;
         const isCurrent = () => this.isCurrentSession(sessionId) && token === this.groupsLoadToken;
         try {
-            const response = await this.fetchWithVersion(this.apiBase+'groups');
-            if (!isCurrent()) return false;
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const groups = await response.json();
+            const groups = await this.fetchApiJson('groups');
             if (!isCurrent()) return false;
             // 오류 객체를 빈 그룹 목록으로 취급하면 저장된 즐겨찾기가 삭제될 수 있다.
             if (!Array.isArray(groups) || groups.some(group => !group || Array.isArray(group) || !Number.isFinite(Number(group.id)))) throw new Error('올바르지 않은 그룹 목록 응답');
             this.groups = groups.map(group => ({id:Number(group.id), name:String(group.name || `그룹 ${group.id}`), description:String(group.description || ''), count:Number(group.count || 0)}));
+            this.groupPreviewCache.clear();
             this.applyGroupOrder();
             const available = new Set(this.groups.map(group => group.id));
             for (const [url, item] of this.knownItems) if (!available.has(item.groupId)) this.knownItems.delete(url);
@@ -927,8 +1046,8 @@ module.exports = class YuikoStickers {
             this.saveGroupSettings();
             const selectedIds = this.selectedGroupId === null ? [...this.enabledGroupIds] : [this.selectedGroupId];
             const loaded = await this.loadGroupItems();
-            if (!isCurrent()) return false;
-            await this.loadMissingSearchKeywords(isCurrent, force, loaded ? selectedIds : []);
+            if (!isCurrent() || !loaded) return false;
+            const indexed = await this.loadMissingSearchKeywords(isCurrent, force, selectedIds);
             if (!isCurrent()) return false;
             await this.loadGroupThumbsFromServer();
             if (!isCurrent()) return false;
@@ -937,19 +1056,17 @@ module.exports = class YuikoStickers {
                 this.render(this.searchInput?.value || '');
             }
             this.saveCache();
-            return true;
+            return indexed !== false;
         } catch (error) {
             if (!isCurrent()) return false;
             console.warn('[YuikoStickers] 그룹 로딩 실패:', error);
-            this.setStatusError('그룹을 불러오지 못했습니다. 클릭하면 다시 시도합니다.');
+            this.setStatusError(`그룹을 불러오지 못했습니다: ${error.message} · 클릭하여 재시도`);
             return false;
         }
     }
 
     async fetchGroupItems(id) {
-        const response = await this.fetchWithVersion(this.apiBase+'group/'+id);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const items = await response.json();
+        const items = await this.fetchApiJson('group/'+id);
         if (!Array.isArray(items) || items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('올바르지 않은 이모지 목록 응답');
         const groupName = this.groups.find(group => group.id === id)?.name || `그룹 ${id}`;
         return items.map(item => {
@@ -960,7 +1077,7 @@ module.exports = class YuikoStickers {
     }
 
     async loadMissingSearchKeywords(isCurrent, force = false, loadedIds = []) {
-        let changed = false;
+        let changed = false, complete = true;
         await Promise.all((this.enabledGroupIds || []).map(async id => {
             if (loadedIds.includes(id)) return;
             const cached = [...this.knownItems.values()].filter(item => item.groupId === id);
@@ -968,7 +1085,8 @@ module.exports = class YuikoStickers {
             if (!force && cached.length === count && cached.every(item => Array.isArray(item.keywords))) return;
             try {
                 const items = await this.fetchGroupItems(id);
-                if (!isCurrent() || !this.enabledGroupIds.includes(id) || !items.length) return;
+                if (!isCurrent() || !this.enabledGroupIds.includes(id)) return;
+                if (!items.length) { if (count > 0) complete=false; return; }
                 const current = [...this.knownItems.values()].filter(item => item.groupId === id);
                 // A newer tab request owns its result; do not overwrite it with this index refresh.
                 if (current.length !== cached.length || current.some((item,index) => item !== cached[index])) return;
@@ -977,10 +1095,12 @@ module.exports = class YuikoStickers {
                 for (const item of items) this.knownItems.set(item.url,item);
                 changed = true;
             } catch (error) {
+                complete = false;
                 if (isCurrent()) console.warn('[YuikoStickers] 검색어 갱신 실패:',id,error.message);
             }
         }));
         if (changed && isCurrent()) this.applyItems(this.items.map(item => this.knownItems.get(item.url)).filter(Boolean));
+        return complete;
     }
 
     async loadGroupItems() {
@@ -999,8 +1119,12 @@ module.exports = class YuikoStickers {
         for (const items of responses) if (items.length) this.groupThumbs[items[0].groupId] = items[0].url;
         this.saveGroupThumbs();
         // 빈 배열로 온 그룹은 서버 오류일 수 있으니 knownItems 정리 대상에서 제외 (즐겨찾기 오삭제 방지)
-        this.applyItems(responses.flat(), ids.filter((id, index) => responses[index].length > 0));
-        return true;
+        const shown = responses.flatMap((items,index) => items.length || !this.groups.find(group => group.id === ids[index])?.count ? items : [...this.knownItems.values()].filter(item => item.groupId === ids[index]));
+        this.applyItems(shown, ids.filter((id, index) => responses[index].length > 0));
+        this.saveCache();
+        const complete = responses.every((items,index) => items.length || !this.groups.find(group => group.id === ids[index])?.count);
+        if (!complete) this.setStatusError('서버에서 빈 이모지 목록을 받았습니다. 저장된 목록을 유지합니다. 클릭하여 재시도');
+        return complete;
     }
 
     // UI 이벤트에서 시작한 요청의 실패도 처리해서 처리되지 않은 Promise를 남기지 않는다.
@@ -1042,11 +1166,13 @@ module.exports = class YuikoStickers {
             // Browsing an already loaded group is local. Opening the panel and
             // the existing latest check still refresh server data separately.
             this.items = cached.flat(); this.itemByUrl = new Map(this.items.map(item => [item.url,item]));
+            this.clearStatusError();
             this.render(this.searchInput.value);
             return;
         }
-        this.grid.classList.remove('is-conti'); this.grid.replaceChildren();
-        this.searchInput.placeholder = '이모지 검색...';
+        // Keep any cached portion visible while missing data loads in the background.
+        this.items = cached.flat(); this.itemByUrl = new Map(this.items.map(item => [item.url,item]));
+        this.render(this.searchInput.value);
         this.clearStatusError(); this.status.textContent = '그룹을 불러오는 중...';
         this.refreshSelectedGroup(this.searchInput);
     }
@@ -1056,16 +1182,17 @@ module.exports = class YuikoStickers {
      */
     async loadGroupThumbsFromServer() {
         const sessionId = this.sessionId;
+        let restored = false;
+        for (const item of this.knownItems.values()) if (!this.groupThumbs[item.groupId]) { this.groupThumbs[item.groupId]=item.url; restored=true; }
+        if (restored) this.saveGroupThumbs();
         const missing = this.groups.filter(group => !this.groupThumbs[group.id]);
         if (!missing.length) return;
         await Promise.all(missing.map(async group => {
             try {
-                const response = await this.fetchWithVersion(this.apiBase+'group/'+group.id);
-                if (!response.ok) return;
-                const items = await response.json();
+                const items = await this.fetchGroupItems(group.id);
                 if (!this.isCurrentSession(sessionId)) return;
-                const first = Array.isArray(items) ? items[0] : null;
-                if (first) this.groupThumbs[group.id] = first.url || `https://snow.modaweb.kr/project/emoji/${String(first.id).padStart(2, '0')}.${first.ext}`;
+                if (items[0]) this.groupThumbs[group.id] = items[0].url;
+                this.groupPreviewCache.set(group.id,items.slice(0,this.groupPreviewCount));
             } catch (error) { console.warn('[YuikoStickers] 그룹 대표 이미지 로딩 실패:', group.id, error.message); }
         }));
         if (!this.isCurrentSession(sessionId)) return;
@@ -1094,41 +1221,57 @@ module.exports = class YuikoStickers {
         }
         for (const item of items) this.knownItems.set(item.url, item);
         this.pruneStoredUrls();
+        this.clearStatusError();
         if (this.grid) this.render(this.searchInput?.value || '');
         if (this.unbindAutocomplete) this.refreshAutocomplete();
     }
 
-    async checkForUpdates(force = false) {
-        const sessionId = this.sessionId;
+    checkForUpdates(force = false) {
+        if (this.latestRequest) return this.latestRequest;
         const now = Date.now();
-        if (!force && now - this.lastCheckAt < this.checkInterval) return;
+        if (!force && now - this.lastCheckAt < this.checkInterval) return Promise.resolve();
         this.lastCheckAt = now;
+        const request = this.checkCatalogUpdates();
+        this.latestRequest = request;
+        const clear = () => { if (this.latestRequest === request) this.latestRequest = null; };
+        request.then(clear,clear);
+        return request;
+    }
+
+    async checkCatalogUpdates() {
+        const sessionId = this.sessionId;
         try {
-            const response = await this.fetchWithVersion(this.apiBase+'latest');
+            const data = await this.fetchApiJson('latest');
             if (!this.isCurrentSession(sessionId)) return;
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const data = await response.json();
-            if (!this.isCurrentSession(sessionId)) return;
-            if (data.datetime !== this.lastDatetime || !this.items.length) {
+            if (!data || !(typeof data.datetime === 'string' && data.datetime || typeof data.datetime === 'number' && Number.isFinite(data.datetime))) throw new Error('올바르지 않은 갱신 시각 응답');
+            if (data.datetime !== this.lastDatetime || !this.groups.length) {
                 if (await this.loadGroups(true) && this.isCurrentSession(sessionId)) { this.lastDatetime = data.datetime; this.saveCache(); }
+            } else {
+                await this.loadMissingSearchKeywords(() => this.isCurrentSession(sessionId));
+                if (this.isCurrentSession(sessionId)) this.saveCache();
             }
         } catch (error) {
             if (!this.isCurrentSession(sessionId)) return;
             console.warn('[YuikoStickers] 갱신 확인 실패:', error.message);
-            if (!this.items.length) this.setStatusError('서버에 연결하지 못했습니다. 클릭하면 다시 시도합니다.');
+            if (!this.items.length) this.setStatusError(`서버에 연결하지 못했습니다: ${error.message} · 클릭하여 재시도`);
         }
     }
-    setStatusError(message) { if (!this.status) return; this.status.textContent = message; this.status.classList.add('is-error'); }
-    clearStatusError() { this.status?.classList.remove('is-error'); }
+    setStatusError(message) { this.statusError = message; if (!this.status) return; this.status.textContent = message; this.status.classList.add('is-error'); }
+    clearStatusError() { this.statusError = null; this.status?.classList.remove('is-error'); }
 
     /**
-     * 캐시 형식: {datetime, known:[item...], shown:[url...]}
+     * 캐시 형식: {datetime, groups:[group...], known:[item...], shown:[url...]}
      * known에는 지금까지 본 모든 이모지를 필요한 필드만, shown에는 마지막으로 표시 중이던 이모지 URL만 저장 (중복 저장 방지)
      */
     loadCache() {
         const saved = BdApi.Data.load(this.pluginName, 'cache');
         if (!saved) return;
         this.lastDatetime = saved.datetime ?? null;
+        if (Array.isArray(saved.groups) && saved.groups.every(group => group && Number.isSafeInteger(group.id) && group.id >= 0 && typeof group.name === 'string' && Number.isFinite(group.count) && group.count >= 0)) {
+            this.groups = saved.groups.map(group => ({id:group.id,name:group.name,description:String(group.description || ''),count:group.count}));
+            this.applyGroupOrder();
+            if (!Array.isArray(this.enabledGroupIds)) this.enabledGroupIds = this.groups.map(group => group.id);
+        }
         const valid = item => item && typeof item.url === 'string' && typeof item.name === 'string';
         const known = Array.isArray(saved.known) ? saved.known : Array.isArray(saved.items) ? saved.items : [];
         this.knownItems = new Map(known.filter(valid).map(item => [item.url, this.slimItem(item)]));
@@ -1142,7 +1285,7 @@ module.exports = class YuikoStickers {
         return saved;
     }
 
-    saveCache() { BdApi.Data.save(this.pluginName, 'cache', {datetime:this.lastDatetime, known:[...this.knownItems.values()].map(item => this.slimItem(item)), shown:this.items.map(item => item.url)}); }
+    saveCache() { BdApi.Data.save(this.pluginName, 'cache', {datetime:this.lastDatetime, groups:this.groups, known:[...this.knownItems.values()].map(item => this.slimItem(item)), shown:this.items.map(item => item.url)}); }
 
     createPanel() {
         if (this.panel) return;
@@ -1158,7 +1301,7 @@ module.exports = class YuikoStickers {
         const managePanel = document.createElement('div'); managePanel.className = 'yuiko-manage';
         const grid = document.createElement('div'); grid.className = 'yuiko-grid';
         const status = document.createElement('div'); status.className = 'yuiko-status';
-        status.addEventListener('click', () => { if (!status.classList.contains('is-error')) return; status.textContent = '다시 불러오는 중...'; status.classList.remove('is-error'); this.loadGroups(true); });
+        status.addEventListener('click', () => { if (!status.classList.contains('is-error')) return; this.clearStatusError(); status.textContent = '다시 불러오는 중...'; this.loadGroups(true); });
         const body = document.createElement('div'); body.className = 'yuiko-body';
         const main = document.createElement('div'); main.className = 'yuiko-main';
         main.append(managePanel, grid); body.append(groupbar, main);
@@ -1198,6 +1341,8 @@ module.exports = class YuikoStickers {
 
     renderGroupControls() {
         if (!this.panel) return;
+        const key = JSON.stringify([this.selectedGroupId,this.contiView,this.enabledGroupIds,this.groups.map(group => [group.id,group.name,group.count,this.groupThumbs[group.id]])]);
+        if (this.groupControlsKey === key) return;
         const restoreScroll = this.capturePanelScroll();
         const bar = this.panel.querySelector('.yuiko-groupbar');
         const management = this.panel.querySelector('.yuiko-manage');
@@ -1210,6 +1355,7 @@ module.exports = class YuikoStickers {
         if (this.contiView) bar.querySelectorAll('[data-group-id]').forEach(button => button.classList.remove('is-active'));
         this.groups.forEach((group, index) => { const row = document.createElement('div'); row.className = 'yuiko-manage-row'; row.dataset.groupId = group.id; const handle = document.createElement('span'); handle.className = 'yuiko-drag-handle'; handle.textContent = '⠿'; handle.title = '드래그해서 순서 변경'; row.appendChild(handle); const label = document.createElement('label'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.dataset.groupId = group.id; checkbox.checked = this.enabledGroupIds?.includes(group.id); label.appendChild(checkbox); const thumb = this.createGroupThumb(group, 'yuiko-manage-thumb'); if (thumb) label.appendChild(thumb); const text = document.createElement('span'); text.textContent = `${group.name} (${group.count})`; label.appendChild(text); const up = document.createElement('button'); up.className = 'yuiko-move'; up.type = 'button'; up.dataset.groupId = group.id; up.dataset.dir = '-1'; up.textContent = '▲'; up.title = '위로'; up.disabled = index === 0; const down = document.createElement('button'); down.className = 'yuiko-move'; down.type = 'button'; down.dataset.groupId = group.id; down.dataset.dir = '1'; down.textContent = '▼'; down.title = '아래로'; down.disabled = index === this.groups.length-1; row.append(label, up, down); management.appendChild(row); });
         restoreScroll();
+        this.groupControlsKey = key;
     }
 
     createGroupPreview() {
@@ -1266,11 +1412,9 @@ module.exports = class YuikoStickers {
         if (known.length) return known.slice(0, this.groupPreviewCount);
         if (this.groupPreviewCache.has(id)) return this.groupPreviewCache.get(id);
         try {
-            const response = await this.fetchWithVersion(this.apiBase+'group/'+id);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const raw = await response.json();
+            const loaded = await this.fetchGroupItems(id);
             if (!this.isCurrentSession(sessionId)) return [];
-            const items = (Array.isArray(raw) ? raw : []).slice(0, this.groupPreviewCount).map(item => ({url:item.url || `https://snow.modaweb.kr/project/emoji/${String(item.id).padStart(2, '0')}.${item.ext}`, name:String(item.word || item.name || '')}));
+            const items = loaded.slice(0,this.groupPreviewCount);
             this.groupPreviewCache.set(id, items);
             return items;
         } catch (error) { console.warn('[YuikoStickers] 그룹 미리보기 로딩 실패:', id, error.message); return []; }
@@ -1393,23 +1537,56 @@ module.exports = class YuikoStickers {
         if (!this.grid) return;
         this.grid.classList.toggle('is-conti',this.contiView);
         this.searchInput.placeholder=this.contiView ? '콘티 이름 또는 호출어 검색...' : '이모지 검색...';
-        if (this.contiView) { this.hidePreview(); this.renderContis(filter); return; }
+        if (this.contiView) { this.gridRenderKey = null; this.hidePreview(); this.renderContis(filter); return; }
         const restoreScroll = this.capturePanelScroll();
         this.cancelLongPress();
         this.hidePreview();
-        const fragment = document.createDocumentFragment();
         const query = filter.trim().toLowerCase();
         const items = this.items.filter(item => !query || this.getSearchText(item).toLowerCase().includes(query));
         // 즐겨찾기는 현재 그룹과 관계없이 전부 표시
         const favoriteItems = [...this.favorites].map(url => this.knownItems.get(url)).filter(item => item && (!query || this.getSearchText(item).toLowerCase().includes(query)));
-        if (favoriteItems.length) { fragment.appendChild(this.createSection(`즐겨찾기 ${favoriteItems.length}`)); favoriteItems.forEach(item => fragment.appendChild(this.createItem(item, 'fav'))); }
-        fragment.appendChild(this.createSection(`${this.selectedGroupId === null ? '선택 그룹' : this.groups.find(group => group.id === this.selectedGroupId)?.name || '그룹'} · 전체 ${items.length}`, true));
-        this.sortItems(items).forEach(item => fragment.appendChild(this.createItem(item)));
-        this.grid.replaceChildren(fragment);
-        this.clearStatusError();
-        this.status.textContent = this.selectedGroupId === null && !this.enabledGroupIds?.length ? '표시할 그룹이 없습니다. ⚙에서 그룹을 선택하세요.' : '';
+        const title = `${this.selectedGroupId === null ? '선택 그룹' : this.groups.find(group => group.id === this.selectedGroupId)?.name || '그룹'} · 전체 ${items.length}`;
+        const sorted = this.sortItems(items);
+        const describe = item => [item.url,item.name,this.favorites.has(item.url)];
+        const key = JSON.stringify([title,this.sortByRecent,favoriteItems.map(describe),sorted.map(describe)]);
+        // Refreshes and panel reopenings often have identical results. Keep the
+        // existing images alive instead of rebuilding a thousand-node grid.
+        if (this.gridRenderKey !== key) {
+            const fragment = document.createDocumentFragment();
+            const occurrences = new Map();
+            const itemNode = (item,section = '') => {
+                const id = JSON.stringify([section,item.url]), index = occurrences.get(id) || 0;
+                occurrences.set(id,index+1);
+                return this.getGridItemNode(item,section,index);
+            };
+            if (favoriteItems.length) { fragment.appendChild(this.createSection(`즐겨찾기 ${favoriteItems.length}`)); favoriteItems.forEach(item => fragment.appendChild(itemNode(item,'fav'))); }
+            fragment.appendChild(this.createSection(title,true));
+            sorted.forEach(item => fragment.appendChild(itemNode(item)));
+            this.grid.replaceChildren(fragment);
+            this.gridRenderKey = key;
+            // Retain nearby filtered results, but bound detached image retention.
+            const cacheLimit = Math.max(1500,favoriteItems.length+sorted.length);
+            for (const [id,node] of this.gridItemNodes) if (!node.isConnected && (!this.knownItems.has(node.dataset.url) || this.gridItemNodes.size > cacheLimit)) this.gridItemNodes.delete(id);
+        }
+        if (this.statusError) this.setStatusError(this.statusError);
+        else if (!this.groups.length && !this.knownItems.size) {
+            if (this.latestRequest || this.groupsRequest) this.status.textContent = '이모지 목록을 불러오는 중...';
+            else this.setStatusError('불러온 이모지 목록이 없습니다. 클릭하여 다시 시도하세요.');
+        } else this.status.textContent = this.selectedGroupId === null && !this.enabledGroupIds?.length ? '표시할 그룹이 없습니다. ⚙에서 그룹을 선택하세요.' : !items.length && !favoriteItems.length ? (query ? '검색 결과가 없습니다.' : '이 그룹에 표시할 이모지가 없습니다.') : '';
         this.updateQueueStatus();
         restoreScroll();
+    }
+
+    getGridItemNode(item, section = '', occurrence = 0) {
+        const key = JSON.stringify([section,item.url,occurrence]);
+        let node = this.gridItemNodes.get(key);
+        if (!node) { node = this.createItem(item,section || null); this.gridItemNodes.set(key,node); }
+        else {
+            node.classList.toggle('is-favorite',this.favorites.has(item.url));
+            const image = node.querySelector('img');
+            if (image.alt !== item.name) image.alt = item.name;
+        }
+        return node;
     }
     createSection(label, withSort = false) {
         const section = document.createElement('div'); section.className = 'yuiko-section';
@@ -1445,7 +1622,7 @@ module.exports = class YuikoStickers {
             this.pendingSendTimers.delete(timer);
             if (!this.isCurrentSession(sessionId) || !composer?.isConnected) return;
             if (expectedKey !== null) {
-                const context = this.getAutocompleteContext();
+                const context = this.getComposerContext();
                 if (context?.composer !== composer || context.key !== expectedKey) {
                     BdApi.UI.showToast('입력 내용이 변경되어 전송을 취소했습니다.', {type:'error'});
                     return;
